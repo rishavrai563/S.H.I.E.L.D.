@@ -1,0 +1,42 @@
+# ──────────────────────────────────────────────────────────
+#  Camera Topology — Locations & Transit Times
+# ──────────────────────────────────────────────────────────
+
+cameras:
+  cam1:
+    name: "Main Gate"
+    building: "Main"
+    floor: 0
+    gps_lat: 28.6139
+    gps_lng: 77.2090
+
+  cam2:
+    name: "Corridor"
+    building: "Main"
+    floor: 1
+    gps_lat: 28.6140
+    gps_lng: 77.2091
+
+  cam3:
+    name: "Hostel A Entrance"
+    building: "Hostel A"
+    floor: 0
+    gps_lat: 28.6141
+    gps_lng: 77.2092
+
+  cam4:
+    name: "Library"
+    building: "Library"
+    floor: 0
+    gps_lat: 28.6142
+    gps_lng: 77.2095
+
+# Transit times in seconds (min, max)
+# If not specified, defaults from config.yaml are used
+transit_times:
+  cam1_cam2: [10, 60]
+  cam1_cam3: [30, 120]
+  cam1_cam4: [30, 120]
+  cam2_cam3: [20, 90]
+  cam2_cam4: [20, 90]
+  cam3_cam4: [30, 120]

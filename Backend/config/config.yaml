@@ -1,0 +1,135 @@
+# ──────────────────────────────────────────────────────────
+#  Multi-Camera Person Tracking — Master Configuration
+# ──────────────────────────────────────────────────────────
+
+system:
+  device: "cuda"                  # "cuda" or "cpu"
+  num_cameras: 4
+
+# ── Detection (YOLOv11m) ──────────────────────────────────
+detection:
+  model_path: "models/yolo11m.pt"
+  high_conf: 0.40                 # High-confidence threshold (allow more new persons)
+  low_conf: 0.07                  # Low-confidence threshold (better recall in crowds)
+  min_area: 120                   # Minimum bbox area in px² (don't drop far persons)
+  nms_iou: 0.75                   # More permissive NMS for close/overlapping people
+  imgsz: 1280                     # Strong-detail mode: slower but better person features
+  person_class: 0                 # COCO class ID for person
+
+# ── Re-ID (OSNet_x1_0) ───────────────────────────────────
+reid:
+  model_name: "osnet_x1_0"
+  model_path: "models/osnet_x1_0_msmt17.pth"
+  embedding_dim: 512
+  input_width: 128
+  input_height: 256
+
+# ── Single-Camera Tracker ─────────────────────────────────
+tracker:
+  # Lifecycle
+  n_confirm: 3                    # Frames to promote Tentative → Active
+  tentative_max_miss: 3           # Max misses before Tentative is killed
+  max_miss: 25                    # Active → Lost after this many misses (longer persistence)
+  lost_buffer_sec: 5.0            # Lost → Removed after this many seconds
+
+  # Cost matrix gating
+  gate_dist_px: 200               # Manhattan distance gate (pixels)
+  mahal_gate: 9.48                # Mahalanobis distance gate (chi² 99%, 4-DOF)
+  cost_threshold_high: 0.65       # Max cost for high-conf assignment
+  cost_threshold_low: 0.70        # Max cost for low-conf assignment
+
+  # Adaptive weights: [motion, appearance, iou]
+  weights_normal: [0.50, 0.40, 0.10]
+  weights_crowd:  [0.20, 0.60, 0.20]
+
+  # Crowd detection
+  crowd_overlap_min: 0.10
+  crowd_score_thr: 0.08
+
+  # Appearance
+  embedding_pool_k: 10            # Top-K best embeddings to keep per track
+  sim_threshold_live: 0.45        # Min appearance similarity for live matching
+  sim_threshold_lost: 0.40        # Min appearance similarity for lost re-link
+
+  # Duplicate birth guard
+  dup_iou_thr: 0.50               # NMS threshold for new track dedup
+  dup_block_sec: 0.30
+
+  # Quality & export
+  min_export_frames: 5            # Min frames for a track to be exported
+  quality_threshold: 0.50         # Min quality to export
+
+# ── Global Matcher ────────────────────────────────────────
+global_matcher:
+  match_threshold: 0.70           # Min cosine similarity for gallery match
+  margin_threshold: 0.08          # Min gap between top-1 and top-2 scores
+  registration_threshold: 0.70    # Min similarity to match registered person
+  ema_alpha: 0.10                 # Prototype update rate (conservative)
+  ema_min_confidence: 0.65        # Only update prototype if match conf >= this
+  same_camera_min_gap: 1.0        # Min seconds between same-person same-camera sightings
+  cross_camera_min_gap: 2.0       # Default min transit time between cameras
+
+# ── Stream Manager ────────────────────────────────────────
+stream:
+  jpeg_quality: 70                # MJPEG encoding quality (0-100)
+  target_fps: 30                  # Target processing FPS
+
+# ── Runtime tuning ────────────────────────────────────────
+runtime:
+  process_max_dim: 960            # Keep more pixels for stronger feature extraction
+  reid_every_n_frames: 1          # ReID every frame for stronger identity consistency
+  detection_event_cooldown_sec: 3.0  # Suppress repeated TRACK_ACTIVATED logs/events
+  global_match_threshold: 0.70    # Cosine threshold for global ID match
+  global_min_track_age: 4         # Only assign global ID when stable enough
+  global_reid_update_every: 4     # Refresh embedding history every N frames
+  global_embedding_history: 8     # Keep last N embeddings per global identity
+  global_identity_ttl_sec: 180.0  # Remove identities not seen for this duration
+  whatsapp_number: "+919638793135"   # WhatsApp alert target
+  whatsapp_alert_delay_sec: 1.0       # Delay before send for stability
+  alerts_enabled: true                # Master switch for alerts
+
+# ── Risk Engine (STRICT — alerts fire rarely, only real threats) ──
+risk:
+  alert_threshold: 90              # Only alert on truly suspicious (risk >= 90)
+  decay_per_sec: 2.5               # Fast decay clears transient noise quickly
+  loiter_seconds: 30               # 30s near-stationary before flagging
+  loiter_displacement_px: 30       # Must be very still (≤30px movement)
+  restricted_zone_dwell_sec: 10    # 10s in restricted area before risk bump
+  entry_zone_dwell_sec: 15         # 15s lingering at entry zone
+  odd_hours_start: 1               # Narrower odd-hours window: 1AM–4AM
+  odd_hours_end: 4
+  high_velocity_px_s: 300          # Only flag very fast motion (running)
+  high_velocity_sustain_frames: 5  # Must sustain high speed for 5+ frames
+  crowd_threshold: 6               # 6+ people before crowd flag
+  entry_exit_window_sec: 120       # Tighter window for frequent pattern
+  frequent_entry_exit_count: 6     # 6 entries in 120s = suspicious
+  min_track_age_sec: 15            # Track must live ≥15s before alert
+  min_concurrent_flags: 2          # ≥2 flag types active simultaneously for alert
+
+# ── Zones (pixel coordinates for current camera framing) ─
+zones:
+  polygons:
+    entry:
+      - [0, 0]
+      - [220, 0]
+      - [220, 220]
+      - [0, 220]
+    restricted:
+      - [420, 80]
+      - [1260, 80]
+      - [1260, 660]
+      - [420, 660]
+
+# ── Privacy ───────────────────────────────────────────────
+privacy:
+  retention_hours: 1.0              # Retain identity vectors/log state for N hours
+
+# ── Visual Enhancements ───────────────────────────────────
+visual:
+  enable_pose_skeleton: true
+  pose_min_detection_confidence: 0.5
+
+# ── API ───────────────────────────────────────────────────
+api:
+  host: "0.0.0.0"
+  port: 8000
