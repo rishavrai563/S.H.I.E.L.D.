@@ -177,11 +177,12 @@ class InteractionDetector:
 
 class RiskAnalyzer:
     """
-    Temporal, track-level risk classifier.
-    Produces stable per-track labels + scene-level status.
+    Temporal, track-level risk classifier for Border Security (IBVAP).
+    Features Mathematical Virtual Fence (Tripwire) using Shapely line intersections.
     """
 
     PRIORITY = {
+        "INTRUSION": 6,           # NEW: Virtual Fence breach (Highest Priority)
         "SUSPICIOUS_MOTION": 5,
         "INTERACTION": 4,
         "NEW_ENTRY": 3,
@@ -198,9 +199,9 @@ class RiskAnalyzer:
         window_size: int = 20,
         min_switch_frames: int = 6,
         new_entry_seconds: float = 2.0,
-        suspicious_enter_speed: float = 220.0,
+        suspicious_enter_speed: float = 350.0,
         suspicious_exit_speed: float = 140.0,
-        isolation_distance_px: float = 260.0,
+        isolation_distance_px: float = 400.0,
         isolation_enter_frames: int = 12,
         isolation_exit_frames: int = 6,
         density_enter: float = 5e-6,
@@ -210,6 +211,8 @@ class RiskAnalyzer:
         interaction_hold_frames: int = 12,
         suspicious_min_frames: int = 8,
     ):
+        from shapely.geometry import LineString # Imported here for strict math
+
         self.frame_width = int(frame_width)
         self.frame_height = int(frame_height)
         self.visible_area = float(max(1, self.frame_width * self.frame_height))
@@ -238,6 +241,21 @@ class RiskAnalyzer:
         self._high_density_active = False
         self._last_scene_status = "CALM"
 
+        # --- NEW: Virtual Fence Configuration ---
+        # Default virtual fence line (can be dynamically updated via API later)
+        # Formatted as [(x1, y1), (x2, y2)]
+        self.virtual_fence_coords = [(50, self.frame_height - 50), (self.frame_width - 50, self.frame_height - 50)]
+        self.virtual_fence_line = LineString(self.virtual_fence_coords)
+        self.intruders = set() # Store track IDs that breached the fence
+
+    def update_fence(self, new_coords: List[Tuple[float, float]]):
+        """Dynamically update the tripwire coordinates from the C&C Dashboard."""
+        from shapely.geometry import LineString
+        if len(new_coords) == 2:
+            self.virtual_fence_coords = new_coords
+            self.virtual_fence_line = LineString(self.virtual_fence_coords)
+            print(f"🚧 Virtual Fence mathematically recalibrated to: {new_coords}")
+
     def _compute_scene_density(self, people_count: int) -> float:
         return float(people_count) / self.visible_area
 
@@ -252,13 +270,9 @@ class RiskAnalyzer:
                     best = label
         return best
 
-    def _track_confidence(
-        self,
-        label: str,
-        speed_px_s: float,
-        interactions: int,
-        state_duration: int,
-    ) -> float:
+    def _track_confidence(self, label: str, speed_px_s: float, interactions: int, state_duration: int) -> float:
+        if label == "INTRUSION":
+            return 1.0 # 100% confidence upon mathematical intersection
         if label == "SUSPICIOUS_MOTION":
             return max(0.0, min(1.0, (speed_px_s - self.suspicious_exit) / max(1.0, self.suspicious_enter - self.suspicious_exit)))
         if label == "INTERACTION":
@@ -271,7 +285,9 @@ class RiskAnalyzer:
             return min(1.0, 0.5 + 0.02 * state_duration)
         return min(1.0, 0.4 + 0.01 * state_duration)
 
-    def _scene_status(self, suspicious_count: int, interaction_count: int, total_tracks: int) -> str:
+    def _scene_status(self, suspicious_count: int, interaction_count: int, total_tracks: int, intrusion_count: int) -> str:
+        if intrusion_count > 0:
+            return "BREACH_DETECTED"
         if suspicious_count >= 2 or interaction_count >= 3 or total_tracks >= 10:
             return "HIGH_ACTIVITY"
         if suspicious_count >= 1 or interaction_count >= 1 or total_tracks >= 5:
@@ -279,21 +295,12 @@ class RiskAnalyzer:
         return "CALM"
 
     def update(self, frame_idx: int, tracks: List[Dict]) -> Dict:
-        """
-        Args:
-            frame_idx: int frame counter
-            tracks: list of {"id": int, "bbox": [x1, y1, x2, y2]}
-        Returns:
-            {
-              "tracks": [per-track structured output],
-              "exits": [track ids],
-              "scene_status": str,
-              "scene_density": float,
-            }
-        """
+        from shapely.geometry import LineString
+        
         states, exits = self.state_manager.update_tracks(frame_idx, tracks)
         interactions = self.interaction_detector.update(tracks)
 
+        # Scene density calculation
         density = self._compute_scene_density(len(tracks))
         if not self._high_density_active:
             self._density_counter = self._density_counter + 1 if density >= self.density_enter else max(0, self._density_counter - 1)
@@ -307,11 +314,12 @@ class RiskAnalyzer:
         track_payload = []
         suspicious_count = 0
         interacting_count = 0
+        intrusion_count = 0
 
         centers = {}
         for tr in tracks:
             x1, y1, x2, y2 = [float(v) for v in tr["bbox"]]
-            centers[int(tr["id"])] = (0.5 * (x1 + x2), 0.5 * (y1 + y2))
+            centers[int(tr["id"])] = (0.5 * (x1 + x2), y2) # Bottom-center coordinate for foot-level crossing
 
         for tr in tracks:
             tid = int(tr["id"])
@@ -321,6 +329,27 @@ class RiskAnalyzer:
             speed_px_s = smooth_speed_px_per_frame * self.fps
             st.speed = speed_px_s
 
+            # --- NEW: Virtual Fence Intersection Math ---
+            # Create a movement vector from previous position to current position
+            if len(st.positions_history) >= 2:
+                # Use the bottom center of the bounding box for accurate ground-level crossing
+                x1, y1, x2, y2 = bbox
+                curr_bottom_center = ((x1 + x2) / 2, y2)
+                
+                # Get the previous bottom center based on history
+                prev_cx, prev_cy = st.positions_history[-2] 
+                # Estimate previous y2 based on current bbox height to maintain scale
+                prev_bottom_center = (prev_cx, prev_cy + ((y2 - y1) / 2)) 
+
+                movement_vector = LineString([prev_bottom_center, curr_bottom_center])
+                
+                # Mathematical intersection verification
+                if self.virtual_fence_line.intersects(movement_vector):
+                    self.intruders.add(tid)
+            
+            is_intruding = tid in self.intruders
+
+            # Existing Anomaly Checks
             if not st.suspicious_active and speed_px_s >= self.suspicious_enter:
                 st.suspicious_active = True
             elif st.suspicious_active and speed_px_s <= self.suspicious_exit:
@@ -350,7 +379,10 @@ class RiskAnalyzer:
                 st.interaction_history[iid] = st.interaction_history.get(iid, 0) + 1
 
             is_new_entry = (frame_idx - st.first_seen_frame) < self.new_entry_frames
+            
+            # Prioritized Flags
             active_flags = {
+                "INTRUSION": is_intruding, # NEW
                 "SUSPICIOUS_MOTION": st.suspicious_active,
                 "INTERACTION": len(interacting_ids) > 0,
                 "NEW_ENTRY": is_new_entry,
@@ -361,15 +393,16 @@ class RiskAnalyzer:
             proposed = self._with_priority(active_flags)
             final_label, duration = self.smoother.stable_label(st, proposed)
 
+            if final_label == "INTRUSION":
+                intrusion_count += 1
             if final_label == "SUSPICIOUS_MOTION":
                 suspicious_count += 1
             if final_label == "INTERACTION":
                 interacting_count += 1
 
             conf = self._track_confidence(final_label, speed_px_s, len(interacting_ids), duration)
-            # Hard gate for true suspicious activity only:
-            # keep SUSPICIOUS_MOTION only when speed remains high long enough
-            # and confidence indicates clear separation from normal motion.
+            
+            # Hard gate for sustained motion
             if final_label == "SUSPICIOUS_MOTION":
                 sustained = duration >= self.suspicious_min_frames
                 high_conf = conf >= 0.90
@@ -378,19 +411,17 @@ class RiskAnalyzer:
                     conf = self._track_confidence("NORMAL", speed_px_s, len(interacting_ids), duration)
             st.confidence = conf
 
-            track_payload.append(
-                {
-                    "id": tid,
-                    "bbox": bbox,
-                    "label": final_label,
-                    "confidence": round(conf, 3),
-                    "speed": round(speed_px_s, 2),
-                    "interaction_with": interacting_ids,
-                    "duration_in_state": int(duration),
-                }
-            )
+            track_payload.append({
+                "id": tid,
+                "bbox": bbox,
+                "label": final_label,
+                "confidence": round(conf, 3),
+                "speed": round(speed_px_s, 2),
+                "interaction_with": interacting_ids,
+                "duration_in_state": int(duration),
+            })
 
-        scene_status = self._scene_status(suspicious_count, interacting_count, len(tracks))
+        scene_status = self._scene_status(suspicious_count, interacting_count, len(tracks), intrusion_count)
         self._last_scene_status = scene_status
         return {
             "tracks": track_payload,

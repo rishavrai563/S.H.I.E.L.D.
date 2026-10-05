@@ -158,10 +158,10 @@ dmypy.json
 Thumbs.db
 
 # Project specific ignores (Models, Videos, Logs)
-models/*.pt
-models/*.pth
-logs/
-*.mp4
-*.avi
-*.mkv
-data/
+# models/*.pt
+# models/*.pth
+# logs/
+# *.mp4
+# *.avi
+# *.mkv
+# data/

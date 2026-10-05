@@ -1,0 +1,23 @@
+# Machine Learning & Computer Vision Core
+torch>=2.1.0
+torchvision>=0.16.0
+ultralytics>=8.3.0
+opencv-python>=4.9.0.80
+numpy>=1.24.0,<2.0.0
+
+# Tracking & Math Operations
+scipy>=1.11.0
+shapely>=2.0.1        # NEW: For mathematical virtual fence intersection
+
+# Command & Control API (NEW)
+fastapi>=0.103.0      # NEW: Replaces the basic HTTP server
+uvicorn[standard]>=0.23.2
+websockets>=11.0.3    # NEW: For real-time React dashboard telemetry
+
+# Specialized IBVAP Analytics (NEW)
+paddleocr>=2.7.0.3    # NEW: For Automatic Number Plate Recognition (ANPR)
+
+# Utilities & Legacy SCOPE Modules
+mediapipe>=0.10.14
+pywhatkit>=5.4
+PyYAML>=6.0.1

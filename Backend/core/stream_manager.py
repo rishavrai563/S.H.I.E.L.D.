@@ -1,24 +1,14 @@
 """
-Stream Manager — Threaded camera capture for multi-camera tracking.
-
-Supports:
-  - Webcams (int): 0, 1, 2...
-  - RTSP streams (str): "rtsp://..."
-  - Video files (str): "video.mp4"
-
-Design:
-  - Each camera runs in its own daemon thread
-  - Single-slot buffer: only the latest frame is kept (no queue backlog)
-  - Lock-protected reads: grab_latest() never blocks processing
-  - Auto-reconnect for RTSP streams on failure
-  - Graceful stop with thread join
+Stream Manager — Threaded camera capture for SHIELD.
+Upgraded with Auto-Night-Time Enhancement (CLAHE) for low-light border surveillance.
 """
 from __future__ import annotations
 
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from datetime import datetime
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
@@ -70,10 +60,10 @@ class CameraStream(threading.Thread):
         # Stats
         self._start_time: float = 0.0
         self._last_frame_time: float = 0.0
+        self._consumed = True  
 
-        # Video file: frame-by-frame delivery (no dropping)
-        # For live streams: single-slot overwrite (lowest latency)
-        self._consumed = True  # True = capture thread may write next frame
+        # Initialize CLAHE for Night-Time Vision Enhancement
+        self._clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 
     def _open_capture(self) -> bool:
         """Open the video capture with optimal settings."""
@@ -82,7 +72,6 @@ class CameraStream(threading.Thread):
                 # RTSP: use FFMPEG backend with TCP for reliability
                 self._cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
                 if self._cap.isOpened():
-                    # Set buffer size to 1 for minimum latency
                     self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             else:
                 self._cap = cv2.VideoCapture(self.source)
@@ -90,7 +79,6 @@ class CameraStream(threading.Thread):
             if not self._cap or not self._cap.isOpened():
                 return False
 
-            # Read stream properties
             self._fps = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
             self._frame_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self._frame_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -100,6 +88,24 @@ class CameraStream(threading.Thread):
         except Exception as e:
             print(f"  [WARN] {self.camera_id}: Failed to open {self.source}: {e}")
             return False
+            
+    def _enhance_night_vision(self, frame: np.ndarray) -> np.ndarray:
+        """Applies CLAHE on the Lightness channel if it is night time."""
+        current_hour = datetime.now().hour
+        # Activate enhancement between 6:00 PM (18) and 6:00 AM (6)
+        if current_hour >= 18 or current_hour < 6:
+            # Convert to LAB color space
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l_channel, a, b = cv2.split(lab)
+            
+            # Apply CLAHE to L channel to enhance contrast without altering colors too much
+            enhanced_l = self._clahe.apply(l_channel)
+            
+            # Merge back and convert to BGR
+            merged = cv2.merge((enhanced_l, a, b))
+            enhanced_frame = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+            return enhanced_frame
+        return frame
 
     def run(self) -> None:
         """Main capture loop — runs in daemon thread."""
@@ -109,13 +115,11 @@ class CameraStream(threading.Thread):
         if not self._open_capture():
             print(f"  [ERROR] {self.camera_id}: Cannot open source: {self.source}")
             if not self._is_rtsp:
-                # Non-RTSP source: don't retry
                 self._running = False
                 return
 
         while self._running:
             if self._cap is None or not self._cap.isOpened():
-                # Reconnect (RTSP only)
                 if self._is_rtsp:
                     print(f"  [INFO] {self.camera_id}: Reconnecting to {self.source}...")
                     time.sleep(self.reconnect_delay)
@@ -127,14 +131,12 @@ class CameraStream(threading.Thread):
             ret, frame = self._cap.read()
             if not ret:
                 if self._is_video_file:
-                    # Video file ended — clear buffer so grab_latest returns None
                     with self._lock:
                         self._latest = None
                     self._connected = False
                     self._running = False
                     break
                 elif self._is_rtsp:
-                    # RTSP lost connection — clear buffer, will reconnect
                     self._connected = False
                     with self._lock:
                         self._latest = None
@@ -142,50 +144,39 @@ class CameraStream(threading.Thread):
                     self._cap = None
                     continue
                 else:
-                    # Webcam error — brief retry
                     time.sleep(0.01)
                     continue
+            
+            # --- NEW: Process Night-Time Frame Enhancement ---
+            enhanced_frame = self._enhance_night_vision(frame)
 
             now = time.time()
             self._frame_count += 1
             self._last_frame_time = now
 
-            # For video files: wait until previous frame was consumed
-            # This ensures EVERY frame is processed (no dropping)
             if self._is_video_file:
                 while not self._consumed and self._running:
                     time.sleep(0.001)
 
-            # Store latest frame (single-slot overwrite for live, blocking for video)
             with self._lock:
-                self._latest = (frame, now)
+                self._latest = (enhanced_frame, now)
                 if self._is_video_file:
                     self._consumed = False
 
-        # Loop exited: stream is no longer connected.
         self._connected = False
 
     def read(self) -> Optional[Tuple[np.ndarray, float]]:
-        """
-        Get the most recent frame and timestamp.
-        Returns None if no frame is available yet.
-        Thread-safe, never blocks.
-        For video files: consumes the frame (clears buffer + signals capture thread).
-        For live streams: returns latest frame without consuming (single-slot).
-        """
         with self._lock:
             data = self._latest
             if self._is_video_file and data is not None:
-                self._latest = None   # Clear so same frame isn't read twice
-                self._consumed = True  # Signal capture thread to read next frame
+                self._latest = None   
+                self._consumed = True  
             return data
 
     def stop(self) -> None:
-        """Signal the capture thread to stop."""
         self._running = False
 
     def release(self) -> None:
-        """Stop thread and release video capture resources."""
         self._running = False
         if self._cap is not None:
             self._cap.release()
@@ -193,12 +184,10 @@ class CameraStream(threading.Thread):
 
     @property
     def is_alive_stream(self) -> bool:
-        """Check if the stream is still producing frames."""
         return self._running and self._connected
 
     @property
     def is_running(self) -> bool:
-        """Check if stream thread is still intended to run (including reconnect loops)."""
         return self._running
 
     @property
@@ -211,49 +200,26 @@ class CameraStream(threading.Thread):
 
     @property
     def frame_size(self) -> Tuple[int, int]:
-        """Returns (width, height)."""
         return self._frame_w, self._frame_h
 
 
 class StreamManager:
-    """
-    Manages all camera streams for the multi-camera tracking system.
-
-    Usage:
-        manager = StreamManager()
-        manager.add_camera(CameraConfig("cam1", 0, "Main Gate"))
-        manager.add_camera(CameraConfig("cam2", "rtsp://...", "Corridor"))
-        manager.start_all()
-
-        # In processing loop:
-        frames = manager.grab_latest()
-        for cam_id, (frame, timestamp) in frames.items():
-            ...
-
-        manager.stop_all()
-    """
-
     def __init__(self):
         self.streams: Dict[str, CameraStream] = {}
         self.configs: Dict[str, CameraConfig] = {}
 
-    def add_camera(self, config: CameraConfig,
-                   reconnect_delay: float = 2.0) -> None:
-        """Add a camera to the manager."""
+    def add_camera(self, config: CameraConfig, reconnect_delay: float = 2.0) -> None:
         stream = CameraStream(config, reconnect_delay=reconnect_delay)
         self.streams[config.camera_id] = stream
         self.configs[config.camera_id] = config
 
     def start_all(self) -> None:
-        """Start all camera capture threads."""
         for cam_id, stream in self.streams.items():
             print(f"  [STREAM] Starting {cam_id}: {stream.source}")
             stream.start()
 
-        # Wait briefly for cameras to produce first frame
         time.sleep(0.5)
 
-        # Report status
         for cam_id, stream in self.streams.items():
             if stream.is_alive_stream:
                 w, h = stream.frame_size
@@ -262,13 +228,6 @@ class StreamManager:
                 print(f"  [STREAM] {cam_id} ✗ not connected")
 
     def grab_latest(self) -> Dict[str, Tuple[np.ndarray, float]]:
-        """
-        Grab the latest frame from ALL cameras at once.
-
-        Returns a dict of {camera_id: (frame, timestamp)}.
-        Only includes cameras that have a frame available.
-        This is the input to the batched detection pipeline.
-        """
         frames: Dict[str, Tuple[np.ndarray, float]] = {}
         for cam_id, stream in self.streams.items():
             data = stream.read()
@@ -277,32 +236,20 @@ class StreamManager:
         return frames
 
     def stop_all(self) -> None:
-        """Stop all camera threads and release resources."""
         for stream in self.streams.values():
             stream.stop()
-
-        # Wait for threads to finish (with timeout)
         for stream in self.streams.values():
             stream.join(timeout=2.0)
-
         for stream in self.streams.values():
             stream.release()
 
     def get_camera_ids(self) -> List[str]:
-        """Get list of all camera IDs."""
         return list(self.streams.keys())
 
     def get_config(self, camera_id: str) -> Optional[CameraConfig]:
-        """Get camera config by ID."""
         return self.configs.get(camera_id)
 
     def all_stopped(self) -> bool:
-        """
-        Check if all streams have fully stopped.
-
-        Important: RTSP streams may be temporarily disconnected while reconnecting.
-        They are not considered stopped unless their run loop has exited.
-        """
         return all(not s.is_running for s in self.streams.values())
 
     @property

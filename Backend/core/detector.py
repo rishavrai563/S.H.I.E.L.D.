@@ -1,68 +1,66 @@
 """
-Person Detector — YOLOv11m wrapper with batch detection and confidence splitting.
-
-Key design decisions:
-- Batch detection: 4 frames → 1 GPU call (instead of 4 separate calls)
-- Confidence split: High (≥0.40) for full matching, Low (0.10-0.40) for occlusion recovery
-- Person class only (COCO class 0): no wasted computation on other objects
+Multi-Class Security Detector — YOLOv11m wrapper for Border Surveillance.
+Detects:
+  - Person (Class 0)
+  - Car (Class 2)
+  - Motorcycle (Class 3)
+  - Bus (Class 5)
+  - Truck (Class 7)
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
-
+from typing import List, Tuple, Dict
 import numpy as np
 from ultralytics import YOLO
 
 
+# Mapping COCO class IDs to operational categories
+TARGET_CLASSES = {
+    0: "person",
+    2: "car",
+    3: "motorcycle",
+    5: "bus",
+    7: "truck"
+}
+
+CLASS_IDS = list(TARGET_CLASSES.keys())  # [0, 2, 3, 5, 7]
+
+
 @dataclass
 class Detection:
-    """A single person detection from YOLO."""
+    """A single object detection from YOLO."""
     bbox: Tuple[float, float, float, float]    # (x1, y1, x2, y2)
     confidence: float
-    
+    class_id: int
+    label: str
+
     def center(self) -> Tuple[float, float]:
         """Get center (cx, cy) of the bounding box."""
         return (self.bbox[0] + self.bbox[2]) * 0.5, (self.bbox[1] + self.bbox[3]) * 0.5
-    
+
     def area(self) -> float:
         """Get area of the bounding box."""
         return max(0.0, self.bbox[2] - self.bbox[0]) * max(0.0, self.bbox[3] - self.bbox[1])
 
+    def is_vehicle(self) -> bool:
+        """Helper to check if detection is a vehicle."""
+        return self.class_id in [2, 3, 5, 7]
 
-class PersonDetector:
+
+class SecurityDetector:
     """
-    YOLOv11m person detector with batch detection support.
-    
-    Usage:
-        detector = PersonDetector("models/yolo11m.pt")
-        
-        # Single frame
-        high_dets, low_dets = detector.detect(frame)
-        
-        # Batch of 4 frames (one GPU call)
-        all_results = detector.batch_detect([frame1, frame2, frame3, frame4])
-        for high_dets, low_dets in all_results:
-            ...
+    Multi-class detector handling human and vehicle surveillance simultaneously.
     """
 
-    def __init__(self, model_path: str = "models/yolo11m.pt",
+    def __init__(self,
+                 model_path: str = "models/yolo11m.pt",
                  device: str = "cuda",
                  high_conf: float = 0.40,
                  low_conf: float = 0.10,
-                 min_area: float = 400.0,
+                 min_area: float = 120.0,
                  nms_iou: float = 0.60,
                  imgsz: int = 640):
-        """
-        Args:
-            model_path: Path to YOLOv11m weights.
-            device:     "cuda" or "cpu".
-            high_conf:  Threshold for high-confidence detections.
-            low_conf:   Threshold for low-confidence detections (occlusion recovery).
-            min_area:   Minimum bbox area in px² to accept (filters out tiny noise).
-            nms_iou:    NMS IOU threshold for YOLO post-processing.
-            imgsz:      Inference resolution passed to YOLO.
-        """
         self.model = YOLO(model_path)
         self.model.to(device)
         self.high_conf = high_conf
@@ -73,20 +71,14 @@ class PersonDetector:
 
     def detect(self, frame: np.ndarray) -> Tuple[List[Detection], List[Detection]]:
         """
-        Detect persons in a single frame.
-        
-        Args:
-            frame: BGR image (numpy array).
-            
+        Detect persons and vehicles in a single frame.
         Returns:
             (high_confidence_detections, low_confidence_detections)
-            High: conf >= high_conf
-            Low:  low_conf <= conf < high_conf
         """
         results = self.model.predict(
             frame,
-            classes=[0],              # Person class only
-            conf=self.low_conf,       # Use low threshold, split afterwards
+            classes=CLASS_IDS,         # Ingest persons + all vehicle classes
+            conf=self.low_conf,
             iou=self.nms_iou,
             imgsz=self.imgsz,
             verbose=False,
@@ -100,12 +92,19 @@ class PersonDetector:
             for box in result.boxes:
                 bbox = tuple(box.xyxy[0].cpu().tolist())
                 conf = float(box.conf.cpu())
-                det = Detection(bbox=bbox, confidence=conf)
-                
-                # Filter tiny detections
+                cls_id = int(box.cls.cpu().item())
+                label = TARGET_CLASSES.get(cls_id, "unknown")
+
+                det = Detection(
+                    bbox=bbox,
+                    confidence=conf,
+                    class_id=cls_id,
+                    label=label
+                )
+
                 if det.area() < self.min_area:
                     continue
-                
+
                 if conf >= self.high_conf:
                     high_dets.append(det)
                 else:
@@ -115,24 +114,14 @@ class PersonDetector:
 
     def batch_detect(self, frames: List[np.ndarray]) -> List[Tuple[List[Detection], List[Detection]]]:
         """
-        Detect persons in multiple frames with a single GPU call.
-        
-        This is the preferred method for multi-camera processing:
-        batch all 4 camera frames → one inference → split results per camera.
-        Gives ~2-3× speedup over calling detect() 4 times.
-        
-        Args:
-            frames: List of BGR images.
-            
-        Returns:
-            List of (high_dets, low_dets) tuples, one per input frame.
+        Batched inference across multiple camera streams.
         """
         if not frames:
             return []
 
         results = self.model.predict(
             frames,
-            classes=[0],
+            classes=CLASS_IDS,
             conf=self.low_conf,
             iou=self.nms_iou,
             imgsz=self.imgsz,
@@ -148,7 +137,15 @@ class PersonDetector:
             for box in result.boxes:
                 bbox = tuple(box.xyxy[0].cpu().tolist())
                 conf = float(box.conf.cpu())
-                det = Detection(bbox=bbox, confidence=conf)
+                cls_id = int(box.cls.cpu().item())
+                label = TARGET_CLASSES.get(cls_id, "unknown")
+
+                det = Detection(
+                    bbox=bbox,
+                    confidence=conf,
+                    class_id=cls_id,
+                    label=label
+                )
 
                 if det.area() < self.min_area:
                     continue
