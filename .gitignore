@@ -165,3 +165,9 @@ Thumbs.db
 # *.avi
 # *.mkv
 # data/
+
+# SHIELD React frontend
+Frontend/node_modules/
+Frontend/.vite/
+Backend/static/*
+!Backend/static/.gitkeep
