@@ -1,16 +1,32 @@
 import asyncio
 import os
+from contextlib import asynccontextmanager
+from pathlib import Path
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from typing import List, Dict, Any
 import time
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    task = asyncio.create_task(run_ml_orchestrator())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 # Create the FastAPI App
 app = FastAPI(
     title="IBVAP Command & Control API",
     description="Intelligent Border Video Analytics Platform",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Enable CORS for the React Frontend
@@ -30,12 +46,12 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-        print(f"🔗 [WebSocket] Frontend C&C Dashboard Connected")
+        print("[WebSocket] Frontend C&C Dashboard Connected")
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
-            print(f"❌ [WebSocket] Frontend C&C Dashboard Disconnected")
+            print("[WebSocket] Frontend C&C Dashboard Disconnected")
 
     async def broadcast(self, message: dict):
         for connection in self.active_connections:
@@ -51,21 +67,44 @@ manager = ConnectionManager()
 @app.get("/api/v1/streams/active")
 async def get_active_streams():
     """Returns the list of active border camera streams."""
-    # TODO: Connect this to the new StreamManager
+    streams = await get_streams()
+    return {
+        "status": streams["status"],
+        "cameras": [
+            {"id": camera["camera_id"], "name": camera["camera_name"], "status": camera["status"]}
+            for camera in streams["cameras"]
+        ],
+    }
+
+@app.get("/api/v1/streams")
+async def get_streams():
+    """Frontend-compatible stream list (static until StreamManager is shared with this process)."""
     return {
         "status": "success",
         "cameras": [
-            {"id": "cam1", "name": "Border Checkpoint Alpha", "status": "active"},
-            {"id": "cam2", "name": "Night-Vision Outpost Bravo", "status": "active"}
-        ]
+            {"camera_id": "cam1", "camera_name": "Highway Checkpost", "status": "configured"},
+            {"camera_id": "cam2", "camera_name": "Border Patrol (Crowd)", "status": "configured"},
+            {"camera_id": "cam3", "camera_name": "Night Vision Sector", "status": "configured"},
+        ],
+    }
+
+@app.get("/api/v1/status")
+async def get_status():
+    """Basic API health; processing metrics are populated when a live pipeline is connected."""
+    return {
+        "status": "online",
+        "telemetry_mode": "simulation",
+        "server_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
 @app.post("/api/v1/fence/config")
+@app.post("/api/v1/config/fence")
 async def update_virtual_fence(payload: Dict[str, Any]):
-    """Receives updated virtual fence coordinates from the frontend."""
-    # TODO: Push these new coordinates into behavior_risk.py math logic
-    print(f"🚧 [API] Virtual Fence Updated: {payload}")
-    return {"status": "success", "message": "Fence updated successfully"}
+    """Rejects changes until this API shares a live RiskAnalyzer with the pipeline."""
+    raise HTTPException(
+        status_code=501,
+        detail="Fence updates are not connected to a running risk engine yet; no changes were applied.",
+    )
 
 # --- WebSocket Endpoint ---
 
@@ -87,12 +126,15 @@ async def run_ml_orchestrator():
     This background task will eventually run our actual YOLO + OSNet + ANPR pipeline.
     For now, it sends dummy telemetry to prove the WebSocket connection works.
     """
-    print("🚀 Starting Background ML Orchestrator...")
+    print("Starting Background ML Orchestrator...")
+    frame_number = 0
     while True:
         await asyncio.sleep(2.0) # Simulate 2 seconds of frame processing
         if manager.active_connections:
+            frame_number += 1
             dummy_telemetry = {
                 "timestamp": time.time(),
+                "frame": frame_number,
                 "camera_id": "cam1",
                 "tracks": [
                     {"id": "G1", "class": "person", "bbox": [100, 100, 200, 300], "risk": 45},
@@ -101,10 +143,11 @@ async def run_ml_orchestrator():
             }
             await manager.broadcast(dummy_telemetry)
 
-@app.on_event("startup")
-async def startup_event():
-    # Spin up the ML pipeline in the background when the server starts
-    asyncio.create_task(run_ml_orchestrator())
+# Serve the Vite build from FastAPI at the same origin. Keep this mount last so
+# API and WebSocket routes remain reachable before the catch-all frontend.
+FRONTEND_DIST = Path(__file__).resolve().parent / "static"
+if FRONTEND_DIST.exists():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
 
 if __name__ == "__main__":
     print("Starting IBVAP API Server on port 8080...")
