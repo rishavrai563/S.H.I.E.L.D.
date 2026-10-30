@@ -450,8 +450,9 @@ async def lifespan(app: FastAPI):
     print("  SHIELD API SERVER — INITIALIZING")
     print("=" * 60)
 
-    # Load configuration
-    state.config = load_config()
+    # Load configuration (use pre-set config from start_api_server if available)
+    if not state.config:
+        state.config = load_config()
     state.camera_configs = load_camera_configs()
     state.async_telemetry_queue = asyncio.Queue(maxsize=50)
     state.running = True
@@ -880,8 +881,12 @@ async def websocket_stream(websocket: WebSocket, camera_id: str):
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════
 
-def start_api_server(host: str = "0.0.0.0", port: int = 8000):
+def start_api_server(host: str = "0.0.0.0", port: int = 8000, config: Optional[dict] = None):
     """Start the SHIELD API server."""
+    # Store the config (with CLI overrides) so the lifespan can use it
+    if config is not None:
+        state.config = config
+
     print(f"\n🌐 Starting SHIELD API on http://{host}:{port}")
     print(f"   📡 Telemetry WebSocket: ws://{host}:{port}/ws/telemetry")
     print(f"   📺 Stream WebSocket:    ws://{host}:{port}/ws/stream/{{camera_id}}")

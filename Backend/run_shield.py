@@ -78,7 +78,7 @@ def run_api_mode(config: dict):
     host = api_config.get("host", "0.0.0.0")
     port = api_config.get("port", 8000)
 
-    start_api_server(host=host, port=port)
+    start_api_server(host=host, port=port, config=config)
 
 
 def main():
