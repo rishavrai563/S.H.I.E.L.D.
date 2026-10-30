@@ -10,9 +10,14 @@ Key design decisions:
 - Batch extraction: all crops from all cameras → single GPU call
 - L2 normalization: required for cosine similarity via dot product
 - High-conf only: we NEVER extract embeddings for low-conf crops (garbage in = garbage out)
+
+Model weights:
+- If model_path exists on disk, loads from there.
+- Otherwise, torchreid auto-downloads the pretrained weights on first run.
 """
 from __future__ import annotations
 
+import os
 from typing import List, Optional
 
 import cv2
@@ -26,7 +31,7 @@ class ReIDEncoder:
     OSNet_x1_0 person re-identification encoder.
     
     Usage:
-        encoder = ReIDEncoder("models/osnet_x1_0_msmt17.pth")
+        encoder = ReIDEncoder()
         
         # Single crop
         embedding = encoder.extract(crop_bgr)  # → (512,)
@@ -43,17 +48,27 @@ class ReIDEncoder:
         """
         Args:
             model_name:   Model architecture name (for torchreid).
-            model_path:   Path to pretrained weights.
+            model_path:   Path to pretrained weights. If file doesn't exist,
+                          torchreid will auto-download MSMT17 weights.
             device:       "cuda" or "cpu".
             input_width:  Model input width (128 for OSNet).
             input_height: Model input height (256 for OSNet).
         """
         self.device = device
         self.input_size = (input_width, input_height)  # (W, H) for PIL resize
+
+        # If the weights file doesn't exist on disk, let torchreid auto-download
+        # by passing model_path='' (it will fetch MSMT17 pretrained weights)
+        effective_path = model_path if os.path.isfile(model_path) else ''
+        
+        if effective_path:
+            print(f"  [ReID] Loading weights from {model_path}")
+        else:
+            print(f"  [ReID] Weights not found at {model_path} — auto-downloading pretrained {model_name}...")
         
         self.extractor = torchreid.utils.FeatureExtractor(
             model_name=model_name,
-            model_path=model_path,
+            model_path=effective_path,
             device=device,
         )
 
