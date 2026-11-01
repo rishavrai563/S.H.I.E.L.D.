@@ -3,18 +3,35 @@ SHIELD Face Authentication Engine
 ---------------------------------
 Scans human crops for faces. Features a safe-fallback mechanism 
 in case the environment's OpenCV build lacks legacy Cascade modules.
+
+The threat watchlist can be populated at runtime via the API's
+register_person() endpoint. The default entries below are demo
+placeholders; in production, replace them with a database lookup.
 """
 import cv2
 import numpy as np
+from typing import Dict
+
 
 class FaceAuthEngine:
-    def __init__(self):
+    def __init__(self, watchlist: Dict[str, str] = None):
+        """
+        Args:
+            watchlist: Optional custom watchlist mapping "G{id}" → threat label.
+                       If None, uses a small demo watchlist.
+        """
         print("👤 Initializing SHIELD Face Auth Engine...")
-        self.threat_watchlist = {
-            "G1": "KNOWN_INTRUDER",
-            "G5": "UNAUTHORIZED_PERSONNEL",
-            "G8": "WANTED_SMUGGLER"
-        }
+
+        # Default demo watchlist — override with a database in production
+        if watchlist is not None:
+            self.threat_watchlist = watchlist
+        else:
+            self.threat_watchlist = {
+                # Demo entries — these match GlobalMatcher IDs if they happen to collide
+                "G1": "KNOWN_INTRUDER",
+                "G5": "UNAUTHORIZED_PERSONNEL",
+                "G8": "WANTED_SMUGGLER",
+            }
         
         # Safely check if the current OpenCV build supports CascadeClassifier
         self.has_cascade = hasattr(cv2, 'CascadeClassifier')
@@ -24,6 +41,14 @@ class FaceAuthEngine:
             self.face_detector = cv2.CascadeClassifier(cascade_path)
         else:
             print("  ⚠️ Notice: Minimal OpenCV build detected. Using heuristic face-auth fallback.")
+
+    def add_to_watchlist(self, global_id: int, threat_label: str):
+        """Add or update a person in the threat watchlist at runtime."""
+        self.threat_watchlist[f"G{global_id}"] = threat_label
+
+    def remove_from_watchlist(self, global_id: int):
+        """Remove a person from the threat watchlist."""
+        self.threat_watchlist.pop(f"G{global_id}", None)
 
     def verify_face(self, human_crop: np.ndarray, global_id: int) -> str:
         """Verifies if the tracked person matches the threat watchlist."""

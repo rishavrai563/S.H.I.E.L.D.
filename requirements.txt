@@ -7,15 +7,16 @@ numpy>=1.24.0,<2.0.0
 
 # Tracking & Math Operations
 scipy>=1.11.0
-shapely>=2.0.1        # NEW: For mathematical virtual fence intersection
+shapely>=2.0.1        # For mathematical virtual fence intersection
 
-# Command & Control API (NEW)
-fastapi>=0.103.0      # NEW: Replaces the basic HTTP server
+# Command & Control API
+fastapi>=0.103.0
 uvicorn[standard]>=0.23.2
-websockets>=11.0.3    # NEW: For real-time React dashboard telemetry
+websockets>=11.0.3    # For real-time React dashboard telemetry
 
-# Specialized IBVAP Analytics (NEW)
-paddleocr>=2.7.0.3    # NEW: For Automatic Number Plate Recognition (ANPR)
+# Specialized IBVAP Analytics
+easyocr>=1.7.0        # For Automatic Number Plate Recognition (ANPR)
+torchreid             # OSNet person re-identification (ReID)
 
 # Utilities & Legacy SCOPE Modules
 mediapipe>=0.10.14
