@@ -10,13 +10,23 @@ function riskFrom(value: unknown): RiskLevel {
   return 'NORMAL'
 }
 
+function timestampFrom(value: unknown, fallback: string): string {
+  if (value == null || value === '') return fallback
+  const numeric = typeof value === 'number' || (typeof value === 'string' && /^\d+(\.\d+)?$/.test(value))
+  if (numeric) return new Date(Number(value) * 1000).toISOString()
+  const parsed = Date.parse(String(value))
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : fallback
+}
+
 function normalizeAlert(raw: any, index: number, fallbackTime: string, cameraId = 'system'): Alert {
   const rawType = String(raw?.alert_type ?? raw?.type ?? 'SECURITY_EVENT')
-  const severity = riskFrom(raw?.risk_level ?? raw?.threat ?? rawType)
+  const impliedSeverity = rawType === 'FACE_MATCH' ? 'CRITICAL' : raw?.threat ?? rawType
+  const severity = riskFrom(raw?.risk_level ?? impliedSeverity)
   const message = String(raw?.message ?? raw?.threat ?? raw?.plate ?? rawType.replace(/_/g, ' '))
+  const alertTimestamp = timestampFrom(raw?.timestamp, fallbackTime)
   return {
-    id: String(raw?.id ?? `${cameraId}-${rawType}-${raw?.timestamp ?? fallbackTime}-${index}`),
-    timestamp: String(raw?.timestamp ?? fallbackTime),
+    id: String(raw?.id ?? `${cameraId}-${rawType}-${raw?.timestamp ?? fallbackTime}-${raw?.plate ?? raw?.threat ?? index}`),
+    timestamp: alertTimestamp,
     camera_id: String(raw?.camera_id ?? raw?.camera ?? cameraId),
     alert_type: rawType,
     message,
@@ -32,7 +42,7 @@ function normalizeTrack(raw: any, index: number): Track | null {
   const riskScore = Number(raw?.risk_score ?? raw?.risk ?? (Number(raw?.confidence ?? 0) * 100))
   return {
     track_id: Number.isFinite(parsedId) ? parsedId : index,
-    class_name: String(raw?.class_name ?? raw?.class ?? 'person'),
+    class_name: String(raw?.class_name ?? raw?.class ?? raw?.label ?? 'person'),
     bbox: bbox.map(Number) as Track['bbox'],
     confidence: Number(raw?.confidence ?? 0),
     speed: raw?.speed == null ? undefined : Number(raw.speed),
@@ -42,7 +52,7 @@ function normalizeTrack(raw: any, index: number): Track | null {
 
 export function normalizeTelemetry(raw: any): TelemetryFrame | null {
   if (!raw || typeof raw !== 'object') return null
-  const timestamp = typeof raw.timestamp === 'string' ? raw.timestamp : new Date(Number(raw.timestamp) * 1000 || Date.now()).toISOString()
+  const timestamp = timestampFrom(raw.timestamp, new Date().toISOString())
   const rawCameras = raw.cameras ?? raw.streams ?? (raw.camera_id ? { [raw.camera_id]: raw } : {})
   if (!rawCameras || typeof rawCameras !== 'object') return null
   const globalAlerts: Alert[] = (Array.isArray(raw.global_alerts) ? raw.global_alerts : Array.isArray(raw.alerts) ? raw.alerts : [])

@@ -42,11 +42,6 @@ from core.behavior_risk import RiskAnalyzer
 from core.anpr import ANPREngine
 from core.face_auth import FaceAuthEngine
 
-try:
-    import pywhatkit
-except ImportError:
-    pywhatkit = None
-
 class Orchestrator:
     def __init__(self,
                  cameras: List[CameraConfig],
@@ -303,7 +298,7 @@ class Orchestrator:
                             for _, crop in crop_map:
                                 threat = self.face_auth.verify_face(crop, match.global_id)
                                 if threat:
-                                    telemetry["alerts"].append({"type": "FACE_MATCH", "threat": threat})
+                                    telemetry["alerts"].append({"type": "FACE_MATCH", "threat": threat, "camera": cam_id})
 
                     # --- BEHAVIOR RISK ---
                     risk_analyzer = self.risk_analyzers[cam_id]

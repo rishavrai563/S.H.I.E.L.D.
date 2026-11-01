@@ -1,30 +1,38 @@
 # SHIELD Frontend
 
-React + TypeScript + Vite dashboard. Vite writes its production build into `Backend/static`, which FastAPI serves at `/`.
+React, TypeScript, and Vite dashboard for the FastAPI video analytics backend.
 
 ## Development
 
-Start the API in one PowerShell terminal from `SHIELD/Backend`:
+Start FastAPI from `SHIELD\Backend` in one PowerShell terminal. Use CPU mode:
 
 ```powershell
-..\venv\Scripts\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8080
+..\venv\Scripts\python.exe run_shield.py --api --device cpu
 ```
 
-Then run these commands from this directory in a second terminal:
+For a supported NVIDIA GPU, first install CUDA-enabled PyTorch as described in the root README, then start it with:
 
 ```powershell
-npm install
-npm run dev -- --host 127.0.0.1
+..\venv\Scripts\python.exe run_shield.py --api --device cuda
 ```
 
-Open the Vite URL printed in the terminal, normally `http://localhost:5173`. The Vite config proxies API and WebSocket requests to FastAPI on port `8080`.
-
-## Production bundle
+Then run Vite from this directory in a second terminal:
 
 ```powershell
-npm run build
+npm.cmd install
+npm.cmd run dev -- --host 127.0.0.1
 ```
 
-Then start FastAPI from `SHIELD/Backend` with the Uvicorn command above and open `http://localhost:8080`.
+Open the local URL Vite prints, normally `http://localhost:5173`. The Vite configuration proxies API requests and telemetry/video WebSockets to FastAPI at `localhost:8000`.
 
-The dashboard understands both the requested `TelemetryFrame` shape and the legacy `streams`/`alerts` shape currently written by `Orchestrator`. The API currently labels its WebSocket feed as simulated, and live camera video is not exposed, so camera cards show telemetry overlays on a placeholder. The fence endpoint returns `501` until it can apply changes to a running risk engine; that engine currently supports a two-point tripwire rather than a polygon. See the root README for the current integration status and complete setup commands.
+## Production build
+
+Run from this directory:
+
+```powershell
+npm.cmd run build
+```
+
+Vite writes the bundle to `Backend/static`. Start the API from `SHIELD\Backend` with `..\venv\Scripts\python.exe run_shield.py --api --device cpu` and open `http://localhost:8000`.
+
+The dashboard consumes `/api/v1/system/status`, `/api/v1/streams/active`, `/api/v1/fence/config`, `/ws/telemetry`, and `/ws/stream/{camera_id}`. Fence configuration is a two-point tripwire matching the current `RiskAnalyzer`. See the root README for setup, the full endpoint list, and command explanations.

@@ -7,7 +7,8 @@ const fallback: CameraStream[] = [
   { camera_id: 'cam3', camera_name: 'Night Vision Sector', status: 'CONNECTING' },
 ]
 const streamStatus: Record<string, CameraStream['status']> = {
-  active: 'ACTIVE', online: 'ACTIVE', offline: 'OFFLINE', connecting: 'CONNECTING', configured: 'CONFIGURED',
+  active: 'ACTIVE', online: 'ACTIVE', offline: 'OFFLINE', stopped: 'OFFLINE',
+  connecting: 'CONNECTING', unknown: 'CONNECTING', configured: 'CONFIGURED',
 }
 
 export function useStreams() {
@@ -17,19 +18,21 @@ export function useStreams() {
     let mounted = true
     const load = async () => {
       try {
-        let response = await fetch('/api/v1/streams')
-        if (response.status === 404) response = await fetch('/api/v1/streams/active')
+        const response = await fetch('/api/v1/streams/active')
         if (response.ok) {
           const payload = await response.json()
           const items = Array.isArray(payload) ? payload : payload.cameras ?? payload.streams ?? []
           if (mounted && items.length) setStreams(items.map((item: any) => ({
             camera_id: String(item.camera_id ?? item.id), camera_name: String(item.camera_name ?? item.name ?? item.id),
             status: streamStatus[String(item.status).toLowerCase()] ?? 'CONFIGURED',
+            width: Number(item.resolution?.width) || undefined,
+            height: Number(item.resolution?.height) || undefined,
+            fps: Number(item.fps) || undefined,
           })))
         }
       } catch { /* Keep configured display fallbacks if the endpoint is unavailable. */ }
       try {
-        const response = await fetch('/api/v1/status')
+        const response = await fetch('/api/v1/system/status')
         if (response.ok && mounted) setServerStatus(await response.json())
       } catch { /* Status is optional; websocket state remains authoritative. */ }
     }

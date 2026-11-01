@@ -1,239 +1,128 @@
 # S.H.I.E.L.D.
 
-**Secure Hostile Intelligence & Enforcement for Live Defense**
+SHIELD is a multi-camera video analytics dashboard backed by a Python computer-vision pipeline. FastAPI starts the configured camera streams and Orchestrator in a worker thread, then serves telemetry, camera frames, and REST APIs to the React dashboard.
 
-AI-powered multi-camera CCTV video analytics platform for real-time person detection, cross-camera tracking, re-identification, vehicle plate recognition, and behavioral risk analysis.
+## Requirements
 
----
+- Windows PowerShell
+- Python 3.10 or newer
+- Node.js and npm
+- A CUDA-capable GPU is recommended. CPU mode is available with `--device cpu` but will process more slowly.
+- The configured camera videos or reachable RTSP sources
 
-## Features
+The first Python setup may take time because PyTorch, EasyOCR, YOLO, and Re-ID dependencies are large. If the OSNet checkpoint is absent, `torchreid` downloads pretrained weights on first startup.
 
-| Module | Description |
+## Build and start the dashboard
+
+Run these commands from the directory containing the `SHIELD` folder. Build the frontend before launching the API so FastAPI has static dashboard files to serve.
+
+```powershell
+cd SHIELD\Backend
+python -m venv ..\venv
+..\venv\Scripts\python.exe -m pip install --upgrade pip
+..\venv\Scripts\python.exe -m pip install -r requirements.txt
+cd ..\Frontend
+npm.cmd install
+npm.cmd run build
+cd ..\Backend
+```
+
+Choose one of these commands from `SHIELD\Backend` to start the API and live pipeline.
+
+**CPU mode** (works without a CUDA-capable GPU, but processes more slowly):
+
+```powershell
+..\venv\Scripts\python.exe run_shield.py --api --device cpu
+```
+
+**CUDA setup:** the general requirements can install a CPU-only PyTorch build. From `SHIELD\Backend`, install the CUDA build and verify it detects the GPU:
+
+```powershell
+..\venv\Scripts\python.exe -m pip install --force-reinstall torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu132
+..\venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"
+```
+
+The verification command should print `True`. This CUDA wheel is large; see the [official PyTorch install commands](https://pytorch.org/get-started/previous-versions/) for other supported versions.
+
+**CUDA mode** (for a supported NVIDIA GPU with CUDA-enabled PyTorch):
+
+```powershell
+..\venv\Scripts\python.exe run_shield.py --api --device cuda
+```
+
+Open [http://localhost:8000](http://localhost:8000). The API starts the live pipeline from `Backend/config/cameras.yaml`; the dashboard bundle is served from `Backend/static`. Change camera sources in that YAML file before starting the API. If CUDA initialization fails, use the CPU command.
+
+## Frontend development mode
+
+Start the API in a first PowerShell terminal from `SHIELD\Backend`. Choose either CPU or CUDA mode:
+
+```powershell
+..\venv\Scripts\python.exe run_shield.py --api --device cpu
+```
+
+For CUDA, first install and verify the CUDA-enabled PyTorch build using the command above, then use this instead:
+
+```powershell
+..\venv\Scripts\python.exe run_shield.py --api --device cuda
+```
+
+Start Vite in a second terminal from `SHIELD\Frontend`:
+
+```powershell
+npm.cmd run dev -- --host 127.0.0.1
+```
+
+Open the Vite URL printed in the terminal, normally [http://localhost:5173](http://localhost:5173). Vite proxies `/api` and `/ws` traffic to FastAPI on port `8000`. Re-run `npm.cmd run build` after frontend changes to update the production dashboard served by FastAPI.
+
+## Standalone computer-vision mode
+
+To run the pipeline with OpenCV display windows and without the web dashboard, run from `SHIELD\Backend`:
+
+```powershell
+..\venv\Scripts\python.exe run_shield.py --device cpu
+```
+
+## API endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/system/status` | Runtime health, processing FPS, cameras, tracks, and uptime |
+| `GET` | `/api/v1/streams/active` | Camera status, resolution, and configured source |
+| `GET` | `/api/v1/streams/{camera_id}/snapshot` | Latest annotated JPEG frame |
+| `POST` | `/api/v1/streams/{camera_id}/control` | Start or stop a camera stream |
+| `GET` | `/api/v1/identities` | Tracked global identities |
+| `GET` | `/api/v1/identities/{global_id}` | Identity details and journey |
+| `GET` | `/api/v1/identities/{global_id}/journey` | Camera movement timeline |
+| `POST` | `/api/v1/identities/register` | Register an identity from a base64 image |
+| `GET` | `/api/v1/alerts` | Recent detected events |
+| `GET` | `/api/v1/risk/summary` | Per-camera risk summary |
+| `POST` | `/api/v1/fence/config` | Set a two-point tripwire for one camera or all cameras |
+
+| WebSocket | Purpose |
 |---|---|
-| **Person Detection** | YOLOv11m multi-class detector (persons + vehicles) with dual-confidence split |
-| **Single-Camera Tracking** | 8-step Kalman + Hungarian pipeline with lost-buffer re-linking and occlusion awareness |
-| **Cross-Camera Re-ID** | OSNet_x1_0 embeddings with 2-phase global matching (early + refined) |
-| **ANPR** | Automatic Number Plate Recognition via EasyOCR |
-| **Face Auth** | Haar cascade face detection with configurable threat watchlist |
-| **Behavioral Risk** | Temporal risk classifier with virtual fence (tripwire) using Shapely geometry |
-| **Night Vision** | CLAHE-based auto-enhancement during nighttime hours |
-| **REST API** | FastAPI server with 11 REST endpoints + 2 WebSocket streams |
-| **Telemetry Logging** | JSONL frame-level logs for cloud ingestion pipelines |
+| `/ws/telemetry` | Live frame telemetry, tracks, scene risk, and alerts |
+| `/ws/stream/{camera_id}` | Binary JPEG frames with annotation overlays for a camera |
 
----
+Interactive API documentation is available at [http://localhost:8000/docs](http://localhost:8000/docs).
 
-## Architecture
+## Configuration and integration notes
 
-```
-StreamManager (threaded capture per camera)
-    |
-    v
-SecurityDetector (YOLOv11m -- batched GPU inference)
-    |
-    +-- Person detections --> ReIDEncoder (OSNet_x1_0 -- batched)
-    |                              |
-    |                              v
-    |                    SingleCameraTracker (per camera)
-    |                              |
-    |                              v
-    |                       GlobalMatcher (cross-camera identity)
-    |                              |
-    |                              v
-    |                        RiskAnalyzer (behavioral analysis)
-    |
-    +-- Vehicle detections --> ANPREngine (EasyOCR plate extraction)
+- `Backend/config/config.yaml` controls the model, processing, tracking, stream, risk, and API settings.
+- `Backend/config/cameras.yaml` defines the camera IDs, names, and video or RTSP sources.
+- The fence editor uses two endpoints because the current risk analyzer implements a tripwire, not a polygon.
+- The REST API and dashboard share the same origin in production. During development, Vite proxies the API and both WebSocket paths.
 
-Orchestrator ties all modules together in a single loop.
-API server wraps the orchestrator with FastAPI + WebSocket telemetry.
-```
+## What the commands do
 
----
-
-## Project Structure
-
-```
-SHIELD/
-|-- Backend/
-|   |-- core/
-|   |   |-- __init__.py          # Package exports
-|   |   |-- orchestrator.py      # Master pipeline -- wires all modules
-|   |   |-- detector.py          # YOLOv11m multi-class detector
-|   |   |-- reid_encoder.py      # OSNet_x1_0 person re-ID encoder
-|   |   |-- tracker.py           # 8-step single-camera tracker
-|   |   |-- kalman.py            # 8-state Kalman filter
-|   |   |-- global_matcher.py    # Cross-camera identity matching
-|   |   |-- behavior_risk.py     # Temporal risk classifier + virtual fence
-|   |   |-- stream_manager.py    # Threaded camera capture + CLAHE
-|   |   |-- anpr.py              # Automatic Number Plate Recognition
-|   |   +-- face_auth.py         # Face detection + threat watchlist
-|   |-- config/
-|   |   |-- config.yaml          # Master configuration
-|   |   +-- cameras.yaml         # Camera topology
-|   |-- models/
-|   |   +-- yolo11m.pt           # YOLOv11m weights
-|   |-- videos/                  # Test video files
-|   |-- logs/                    # Runtime telemetry logs (auto-created)
-|   |-- tests/                   # Pytest test suite (13 files, ~100 tests)
-|   |-- api.py                   # FastAPI server with WebSocket streaming
-|   |-- run_shield.py            # CLI + API launcher
-|   +-- requirements.txt         # Python dependencies
-|-- .gitignore
-|-- LICENSE
-+-- README.md
-```
-
----
-
-## Quick Start
-
-### 1. Prerequisites
-
-- Python 3.10+
-- CUDA-compatible GPU (recommended) or CPU
-- pip or conda
-
-### 2. Install Dependencies
-
-```bash
-cd Backend
-pip install -r requirements.txt
-```
-
-> **Note:** On first run, if `models/osnet_x1_0_msmt17.pth` is not present, the ReID encoder will auto-download pretrained MSMT17 weights via torchreid.
-
-### 3. Configure Cameras
-
-Edit `Backend/config/cameras.yaml` to define your camera sources:
-
-```yaml
-cameras:
-  - camera_id: "cam1"
-    name: "Main Gate"
-    source: "rtsp://user:pass@192.168.1.100/stream"
-    gps_lat: 28.6139
-    gps_lng: 77.2090
-
-  - camera_id: "cam2"
-    name: "Parking Lot"
-    source: 0  # Local webcam
-```
-
-Supported sources:
-- **RTSP streams:** `rtsp://...`
-- **Video files:** `videos/recording.mp4`
-- **Webcams:** `0`, `1`, etc.
-
-### 4. Run
-
-**CLI mode** (with OpenCV display windows):
-
-```bash
-cd Backend
-python run_shield.py
-```
-
-**API server mode** (headless, for dashboard integration):
-
-```bash
-cd Backend
-python run_shield.py --api
-```
-
-**With options:**
-
-```bash
-python run_shield.py --api --port 9000 --host 0.0.0.0 --device cuda
-```
-
-### 5. Run Tests
-
-```bash
-cd Backend
-python -m pytest tests/ -v
-```
-
----
-
-## API Reference
-
-### REST Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/v1/system/status` | System health -- uptime, FPS, active cameras, tracks |
-| `GET` | `/api/v1/streams/active` | All camera streams with status and resolution |
-| `GET` | `/api/v1/streams/{id}/snapshot` | Latest annotated JPEG frame from a camera |
-| `POST` | `/api/v1/streams/{id}/control` | Start/stop an individual camera |
-| `GET` | `/api/v1/identities` | All tracked global identities |
-| `GET` | `/api/v1/identities/{id}` | Single identity details + journey history |
-| `GET` | `/api/v1/identities/{id}/journey` | Movement timeline across cameras |
-| `POST` | `/api/v1/identities/register` | Register a known person (name + face image) |
-| `GET` | `/api/v1/alerts` | Recent alerts with optional type filter |
-| `GET` | `/api/v1/risk/summary` | Per-camera risk analysis summary |
-| `POST` | `/api/v1/fence/config` | Update virtual fence coordinates |
-
-### WebSocket Endpoints
-
-| Endpoint | Description |
-|----------|-------------|
-| `ws://host:port/ws/telemetry` | Live JSON telemetry stream (tracks, risk, alerts) |
-| `ws://host:port/ws/stream/{camera_id}` | Live MJPEG frame stream for a specific camera |
-
-### Interactive Docs
-
-When running in API mode, visit `http://localhost:8000/docs` for the auto-generated Swagger UI.
-
----
-
-## Configuration
-
-All tunable parameters live in `Backend/config/config.yaml`. The orchestrator reads this file and passes values to each component -- **no hardcoded values in the pipeline**.
-
-Key sections:
-
-| Section | Controls |
-|---------|----------|
-| `system` | Device (cuda/cpu), number of cameras |
-| `detection` | YOLO confidence thresholds, NMS IOU, image size |
-| `reid` | OSNet model, embedding dimensions |
-| `tracker` | Lifecycle thresholds, cost matrix weights, appearance similarity |
-| `global_matcher` | Cross-camera match/margin thresholds, EMA update rate |
-| `risk` | Alert threshold, loiter/velocity/crowd parameters |
-| `zones` | Polygon coordinates for entry/restricted areas |
-| `stream` | JPEG quality, target FPS |
-| `runtime` | ReID frequency, global ID settings, alert cooldowns |
-| `api` | Host, port |
-
----
-
-## How It Works
-
-### Detection Pipeline
-
-1. **Frame Capture** -- `StreamManager` runs a daemon thread per camera, storing only the latest frame (no backlog)
-2. **Batched Detection** -- All camera frames are batched into a single YOLO inference call on GPU
-3. **Dual-Confidence Split** -- Detections above `high_conf` (0.40) get full ReID processing; detections between `low_conf` (0.07) and `high_conf` are used only for keeping existing tracks alive during occlusion
-
-### Tracking Pipeline
-
-4. **Kalman Predict** -- 8-state constant-velocity Kalman filter predicts each track's next position
-5. **Hungarian Assignment** -- Gated cost matrix (motion + appearance + IOU) with cascade matching (active tracks get priority over tentative)
-6. **Lost Buffer** -- Tracks missing for a few frames are held in a buffer for re-linking via appearance matching
-7. **Birth Guard** -- Multi-layer duplicate prevention (IOU, appearance, aspect ratio) before creating new tracks
-
-### Cross-Camera Re-ID
-
-8. **Phase 1 (Early)** -- When a track is confirmed, its best embedding is matched against the global gallery for immediate GlobalID assignment
-9. **Phase 2 (Refined)** -- When a track ends, its pooled embedding (median of top-K) is used for more accurate cross-camera association and prototype update
-
-### Risk Analysis
-
-10. **Behavioral Classification** -- Temporal analysis of speed, proximity, zone dwell time, and interaction patterns
-11. **Virtual Fence** -- Mathematical tripwire using Shapely `LineString.intersects()` on track movement vectors
-12. **Scene Status** -- Aggregated scene-level classification (CALM > ACTIVE > HIGH_ACTIVITY > BREACH_DETECTED)
-
----
-
-## License
-
-MIT License -- see [LICENSE](LICENSE) for details.
+1. `cd SHIELD\Backend` enters the backend folder; the pipeline expects model and video paths relative to it.
+2. `python -m venv ..\venv` creates a Python virtual environment beside the project folder.
+3. `..\venv\Scripts\python.exe -m pip install --upgrade pip` updates pip in that environment.
+4. `..\venv\Scripts\python.exe -m pip install -r requirements.txt` installs the backend, ML, API, and test dependencies.
+5. `cd ..\Frontend` enters the React/Vite app.
+6. `npm.cmd install` installs the frontend packages recorded in `package-lock.json`.
+7. `npm.cmd run build` type-checks and builds the dashboard into `Backend/static`.
+8. `cd ..\Backend` returns to the backend folder for startup.
+9. `..\venv\Scripts\python.exe run_shield.py --api --device cpu` starts FastAPI and the live camera analytics pipeline in headless CPU mode.
+10. `..\venv\Scripts\python.exe run_shield.py --api --device cuda` starts the same API and pipeline using CUDA acceleration.
+11. `..\venv\Scripts\python.exe run_shield.py --device cpu` runs the standalone pipeline with OpenCV display windows.
+12. `npm.cmd run dev -- --host 127.0.0.1` runs Vite locally and proxies backend requests to port `8000`.

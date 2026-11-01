@@ -25,7 +25,7 @@ export default function Header({ status, fps, latency, serverStatus, criticalCou
       </div>
       <div className="flex flex-wrap items-center gap-2 sm:gap-3">
         <div className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold ring-1 ${statusStyles[status]}`}><span className={`h-1.5 w-1.5 rounded-full ${status === 'CONNECTED' ? 'animate-pulse bg-emerald-300' : status === 'ERROR' ? 'bg-rose-300' : 'bg-amber-300'}`} /><Icon size={14} />{status}</div>
-        <div className="metric-chip"><Activity size={14} className="text-cyan-300" /><span>{fps ?? serverStatus?.processing_fps ?? '—'} <small>FPS</small></span></div>
+        <div className="metric-chip"><Activity size={14} className="text-cyan-300" /><span>{fps ?? serverStatus?.processing_fps ?? serverStatus?.fps ?? '—'} <small>FPS</small></span></div>
         <div className="metric-chip"><span className="text-cyan-300">◷</span><span>{latency ?? serverStatus?.latency_ms ?? '—'} <small>ms</small></span></div>
         <div className="metric-chip hidden md:flex" title="Server time when the API reports it"><Clock3 size={14} className="text-slate-400" /><span className="tabular-nums">{new Date(clock.getTime() + serverOffset).toLocaleTimeString()}</span></div>
         <div className={`metric-chip ${criticalCount ? 'text-rose-300' : 'text-slate-400'}`}><Bell size={14} /><span>{criticalCount} <small>CRITICAL</small></span></div>

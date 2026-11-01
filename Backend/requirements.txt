@@ -5,6 +5,8 @@ torch>=2.0.0
 torchvision>=0.15.0
 ultralytics>=8.1.0           # YOLOv11m object detection
 torchreid>=0.2.5             # OSNet person re-identification
+gdown>=5.2.0                 # Download OSNet weights used by torchreid
+tensorboard>=2.12            # Required by torchreid's engine imports
 
 # Computer Vision & Image Processing
 opencv-python>=4.8.0

@@ -45,10 +45,12 @@ export interface CameraStream {
   status: 'ACTIVE' | 'OFFLINE' | 'CONNECTING' | 'CONFIGURED'
   width?: number
   height?: number
+  fps?: number
 }
 
 export interface ServerStatus {
   status: string
+  fps?: number
   processing_fps?: number
   latency_ms?: number
   server_time?: string

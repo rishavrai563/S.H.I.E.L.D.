@@ -17,6 +17,8 @@ websockets>=11.0.3    # For real-time React dashboard telemetry
 # Specialized IBVAP Analytics
 easyocr>=1.7.0        # For Automatic Number Plate Recognition (ANPR)
 torchreid             # OSNet person re-identification (ReID)
+gdown>=5.2.0          # Download OSNet weights used by torchreid
+tensorboard>=2.12     # Required by torchreid's engine imports
 
 # Utilities & Legacy SCOPE Modules
 mediapipe>=0.10.14

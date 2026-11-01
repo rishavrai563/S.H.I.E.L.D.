@@ -158,16 +158,21 @@ dmypy.json
 Thumbs.db
 
 # Project specific ignores (Models, Videos, Logs)
-# models/*.pt
-# models/*.pth
-# logs/
-# *.mp4
-# *.avi
-# *.mkv
-# data/
+Backend/logs/*
+!Backend/logs/.gitkeep
+Backend/Ultralytics/
+Backend/.torch_cache/
+Backend/models/*.pt
+Backend/models/*.pth
+Backend/models/*.onnx
+!Backend/models/yolo11m.pt
 
 # SHIELD React frontend
 Frontend/node_modules/
 Frontend/.vite/
+Frontend/*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 Backend/static/*
 !Backend/static/.gitkeep

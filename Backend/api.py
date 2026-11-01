@@ -34,6 +34,7 @@ import yaml
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # Core SHIELD Modules
@@ -262,7 +263,7 @@ class APIOrchestrator(Orchestrator):
                             for _, crop in crop_map:
                                 threat = self.face_auth.verify_face(crop, match.global_id)
                                 if threat:
-                                    telemetry["alerts"].append({"type": "FACE_MATCH", "threat": threat})
+                                    telemetry["alerts"].append({"type": "FACE_MATCH", "threat": threat, "camera": cam_id})
 
                     # --- BEHAVIOR RISK ---
                     risk_analyzer = self.risk_analyzers[cam_id]
@@ -547,6 +548,8 @@ async def get_system_status():
 
     return {
         "status": "operational" if state.running else "stopped",
+        "telemetry_mode": "live",
+        "server_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "uptime_seconds": round(uptime, 2),
         "fps": round(fps, 2),
         "frame_count": state.frame_count,
@@ -875,6 +878,13 @@ async def websocket_stream(websocket: WebSocket, camera_id: str):
         await ws_manager.disconnect_stream(websocket, camera_id)
     except Exception:
         await ws_manager.disconnect_stream(websocket, camera_id)
+
+
+# Serve Vite's production build when present. Keep this catch-all mount after
+# every API and WebSocket route so it cannot shadow them.
+FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
 
 
 # ═══════════════════════════════════════════════════════════

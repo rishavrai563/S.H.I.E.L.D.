@@ -22,6 +22,15 @@ from typing import List, Optional
 
 import cv2
 import numpy as np
+
+# Keep torch/torchreid checkpoints inside this checkout by default. This makes
+# first-run model downloads work in restricted home directories and keeps the
+# generated cache easy to exclude from version control.
+os.environ.setdefault(
+    "TORCH_HOME",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".torch_cache"),
+)
+
 import torch
 import torchreid
 

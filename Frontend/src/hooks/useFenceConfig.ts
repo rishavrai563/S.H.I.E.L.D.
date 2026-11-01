@@ -7,9 +7,9 @@ export function useFenceConfig() {
   const saveFence = async (camera_id: string, fence_points: FencePoint[]) => {
     setSaving(true); setError(null)
     try {
-      const response = await fetch('/api/v1/config/fence', {
+      const response = await fetch('/api/v1/fence/config', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ camera_id, fence_points }),
+        body: JSON.stringify({ camera_id, points: fence_points }),
       })
       if (!response.ok) {
         const body = await response.json().catch(() => ({}))
