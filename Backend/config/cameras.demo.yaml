@@ -1,0 +1,55 @@
+# SHIELD demo topology: 3 stock videos (looping) + 1 phone running IP Webcam
+#
+#   ..\venv\Scripts\python.exe scripts\check_camera.py http://<phone-ip>:8080/video   # test phone first
+#   ..\venv\Scripts\python.exe run_shield.py --api --device cuda --cameras config/cameras.demo.yaml
+#
+# The phone must be on the same network as the laptop (see README "Live cameras").
+# If the phone is offline the videos still run; the phone joins as soon as it is reachable.
+
+cameras:
+  - camera_id: "cam1"
+    name: "Highway Checkpost"
+    source: "videos/cam1_traffic.mp4"
+    loop: true
+    realtime: true   # play at native speed like a live camera (smooth video)
+    gps_lat: 28.6139
+    gps_lng: 77.2090
+
+  - camera_id: "cam2"
+    name: "Border Patrol (Crowd)"
+    source: "videos/cam2_crowd.mp4"
+    loop: true
+    realtime: true   # play at native speed like a live camera (smooth video)
+    gps_lat: 28.6140
+    gps_lng: 77.2091
+
+  - camera_id: "cam3"
+    name: "Night Vision Sector"
+    source: "videos/cam3_night.mp4"
+    loop: true
+    realtime: true   # play at native speed like a live camera (smooth video)
+    night_mode: "on"
+    gps_lat: 28.6141
+    gps_lng: 77.2092
+
+  - camera_id: "cam4"
+    name: "Mobile Unit (Phone)"
+    source: "http://10.122.102.58:8080/video"  # IPv4 address shown in IP Webcam + /video (phone hotspot)
+    rotate: 90       # phone held upright streams sideways; 90 = turn clockwise. Use 0 if the
+                     # dashboard shows it sideways again (e.g. phone held in landscape) or 270 if upside down
+
+  - camera_id: "cam5"
+    name: "Laptop"
+    source: 0          # built-in laptop webcam
+    width: 1280
+    height: 720
+
+# Laptop and phone may watch the same room: allow the same person on both at once,
+# so walking between them keeps one G-number (see cameras.laptop_phone.yaml).
+settings:
+  global_matcher:
+    cross_camera_min_gap: 0
+    cross_camera_match_threshold: 0.74
+    cross_camera_margin: 0.08
+  runtime:
+    global_rematch_frames: 90

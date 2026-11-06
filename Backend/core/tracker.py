@@ -259,6 +259,14 @@ def _cosine_sim(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
 # track_has_neighbor logic in _associate(). See Bug 6 fix.
 
 
+def _containment(inner, outer) -> float:
+    """Fraction of box `inner` that lies inside box `outer` (0..1)."""
+    iw = max(0.0, min(inner[2], outer[2]) - max(inner[0], outer[0]))
+    ih = max(0.0, min(inner[3], outer[3]) - max(inner[1], outer[1]))
+    area = max(1e-6, (inner[2] - inner[0]) * (inner[3] - inner[1]))
+    return iw * ih / area
+
+
 def _nms_dedup(detections: List[Detection], iou_threshold: float = 0.70) -> List[Detection]:
     """
     Custom NMS on unmatched detections before creating tentative tracks.
@@ -690,13 +698,20 @@ class SingleCameraTracker:
             if is_dup:
                 continue
 
-            # ── Check 4: Aspect ratio guard for merged detections ──
-            # YOLO sometimes outputs a single wide bbox for two people
-            # walking side-by-side. Reject overly wide boxes at birth.
+            # ── Check 4: Merged-detection guard ──
+            # YOLO sometimes outputs one wide bbox spanning two people walking
+            # side-by-side. Reject a wide box only when it really covers two
+            # other people; wide boxes on their own are legitimate (a person
+            # crawling under a fence, lying down, or cut off by the frame edge).
             det_w = det.bbox[2] - det.bbox[0]
             det_h = det.bbox[3] - det.bbox[1]
             if det_h > 0 and det_w / det_h > 1.5:
-                continue  # Too wide — likely merged detection
+                covered = sum(
+                    1 for o in high_dets + low_dets
+                    if o.bbox != det.bbox and _containment(o.bbox, det.bbox) > 0.6
+                )
+                if covered >= 2:
+                    continue  # merged box over 2+ separately-detected people
 
             # ── Truly new person — create tentative track ──
             new_track = self._create_track(det, det_emb, timestamp)

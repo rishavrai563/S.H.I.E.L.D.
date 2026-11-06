@@ -287,3 +287,34 @@ class TestSingleCameraTracker:
         ended = [e for e in events if e.type == "TRACK_ENDED"]
         assert len(ended) >= 1
         assert len(tracker.tracks) == 0
+
+
+class TestWideBoxBirth:
+    """Wide boxes (crawling / lying / sideways-camera people) must still become tracks;
+    only a wide box that covers two separately-detected people is treated as merged."""
+
+    @staticmethod
+    def _emb(seed):
+        v = np.random.RandomState(seed).randn(512).astype(np.float32)
+        return v / np.linalg.norm(v)
+
+    def _run(self, high, low=()):
+        t = SingleCameraTracker("c", frame_w=1920, frame_h=1080, n_confirm=3)
+        embs = {i: self._emb(i) for i in range(len(high))}
+        for k in range(6):
+            t.update(list(high), list(low), embs, k * 0.2)
+        return t
+
+    def test_lone_wide_person_is_tracked(self):
+        crawler = _det(400, 700, 1000, 850)          # 600 x 150, ratio 4
+        assert len(self._run([crawler]).active_ids) == 1
+
+    def test_wide_and_upright_people_both_tracked(self):
+        lying, sitting = _det(270, 40, 835, 200), _det(400, 195, 645, 395)
+        assert len(self._run([lying, sitting]).active_ids) == 2
+
+    def test_merged_box_over_two_people_rejected(self):
+        a, b = _det(100, 300, 300, 500), _det(320, 300, 520, 500)   # two crouching people
+        merged = _det(90, 290, 530, 510, conf=0.5)   # one wide box spanning both
+        t = self._run([a, b, merged])
+        assert len(t.active_ids) == 2

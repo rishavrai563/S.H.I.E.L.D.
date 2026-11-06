@@ -1,0 +1,38 @@
+# SHIELD camera topology: live cameras (phones running "IP Webcam" + laptop webcam)
+#
+# Start with:   ..\venv\Scripts\python.exe run_shield.py --api --device cuda --cameras config/cameras.live.yaml
+#
+# Phone setup (any "IP Webcam"-style app that serves an MJPEG or RTSP URL works):
+#   1. Phones and laptop on the SAME Wi-Fi network (or phone hotspot the laptop joins).
+#   2. In the app set video resolution to 1280x720 (higher only wastes Wi-Fi), quality ~50-70,
+#      and stop the phone from sleeping.
+#   3. Start the server in the app. It shows an address such as  http://192.168.x.y:8080
+#   4. Use the app's video-stream URL below. For the common IP Webcam app that is the
+#      address + "/video". Open it in a laptop browser first: you should see live video.
+#      If the app has a login set, use  http://user:password@192.168.x.y:8080/video
+#   Any RTSP URL the app offers also works (e.g. rtsp://192.168.x.y:8080/h264_ulaw.sdp).
+#
+# Laptop webcam: source 0 (an external USB webcam is usually 1).
+# Unplugged / offline phones are retried every few seconds; they do not stop the system.
+#
+# Cross-camera identity: if two cameras can see the SAME spot at the same time
+# (e.g. phones pointing at one room), set  global_matcher.cross_camera_min_gap: 0
+# in config.yaml, otherwise the same person gets a different global ID per camera.
+
+cameras:
+  - camera_id: "cam1"
+    name: "Laptop Webcam"
+    source: 0
+    width: 1280
+    height: 720
+
+  - camera_id: "cam2"
+    name: "Phone 1"
+    source: "http://192.168.1.101:8080/video"     # <-- change to phone 1's IP
+
+  - camera_id: "cam3"
+    name: "Phone 2"
+    source: "http://192.168.1.102:8080/video"     # <-- change to phone 2's IP
+
+  # Add more phones the same way (cam4, cam5, ...). On an RTX 3050 expect about
+  # 16 FPS in total, shared between cameras (e.g. 4 cams ≈ 4 FPS each at imgsz 960).

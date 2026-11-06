@@ -15,5 +15,6 @@ cameras:
   - camera_id: "cam3"
     name: "Night Vision Sector"
     source: "videos/cam3_night.mp4"
+    night_mode: "on"        # fixed night camera (floodlit scene defeats brightness detection)
     gps_lat: 28.6141
     gps_lng: 77.2092
