@@ -28,6 +28,7 @@ export function useStreams() {
             width: Number(item.resolution?.width) || undefined,
             height: Number(item.resolution?.height) || undefined,
             fps: Number(item.fps) || undefined,
+            gps: Number.isFinite(Number(item.gps?.lat)) && Number(item.gps?.lat) !== 0 ? { lat: Number(item.gps.lat), lng: Number(item.gps.lng) } : undefined,
           })))
         }
       } catch { /* Keep configured display fallbacks if the endpoint is unavailable. */ }

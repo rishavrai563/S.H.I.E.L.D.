@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AlertTriangle, Bell, CheckCheck, Filter, Siren, Volume2, VolumeX } from 'lucide-react'
+import { Bell, Trash2, Volume2, VolumeX } from 'lucide-react'
 import type { Alert, RiskLevel } from '../types/telemetry'
 
 interface Props { alerts: Alert[]; cameraIds: string[]; criticalFlash: number; onClear: () => void }
-const severityStyle: Record<RiskLevel, string> = { NORMAL: 'text-slate-400 bg-slate-400/10', WARNING: 'text-amber-300 bg-amber-400/10', CRITICAL: 'text-rose-300 bg-rose-400/10' }
+
+const levelText: Record<RiskLevel, string> = { NORMAL: 'Info', WARNING: 'Watch', CRITICAL: 'Respond' }
+const levelTag: Record<RiskLevel, string> = { NORMAL: 'tag-normal', WARNING: 'tag-warning', CRITICAL: 'tag-critical' }
+const typeText = (type: string) => type.toLowerCase().replace(/_/g, ' ').replace(/^\w/, c => c.toUpperCase())
+
 export default function AlertFeed({ alerts, cameraIds, criticalFlash, onClear }: Props) {
   const [camera, setCamera] = useState('ALL')
   const [severity, setSeverity] = useState('ALL')
@@ -33,13 +37,40 @@ export default function AlertFeed({ alerts, cameraIds, criticalFlash, onClear }:
   useEffect(() => {
     if (sound && criticalFlash && criticalFlash !== lastSound.current) { lastSound.current = criticalFlash; void playAlert() }
   }, [sound, criticalFlash, playAlert])
-  return <section className="rounded-xl border border-shield-line bg-shield-panel/80">
-    <div className="flex items-center justify-between border-b border-white/5 px-4 py-4"><div><p className="eyebrow">LIVE MONITOR</p><h2 className="section-title">Event feed <span className="ml-2 font-mono text-sm font-normal text-slate-500">{alerts.length}</span></h2></div><button title="Clear alert history" onClick={onClear} className="icon-button"><CheckCheck size={15} /></button></div>
-    <div className="flex flex-wrap items-center gap-2 border-b border-white/5 px-4 py-3"><Filter size={13} className="text-slate-500" /><select aria-label="Filter by camera" value={camera} onChange={e => setCamera(e.target.value)} className="filter-select"><option value="ALL">All cameras</option>{cameras.map(id => <option key={id}>{id}</option>)}</select><select aria-label="Filter by severity" value={severity} onChange={e => setSeverity(e.target.value)} className="filter-select"><option value="ALL">All severity</option><option>NORMAL</option><option>WARNING</option><option>CRITICAL</option></select><button onClick={toggleSound} className={`ml-auto inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[10px] font-medium ${sound ? 'bg-emerald-400/10 text-emerald-300' : 'bg-slate-800 text-slate-400'}`}>{sound ? <Volume2 size={13} /> : <VolumeX size={13} />}{sound ? 'Sound on' : 'Sound off'}</button></div>
-    <div className="max-h-[430px] overflow-auto p-2">
-      {filtered.length ? <ul className="space-y-1">{filtered.map(alert => { const Icon = alert.risk_level === 'CRITICAL' ? Siren : alert.risk_level === 'WARNING' ? AlertTriangle : Bell; return <li key={`${alert.id}-${alert.risk_level === 'CRITICAL' ? criticalFlash : 0}`} className={`rounded-lg border border-transparent p-3 hover:border-white/5 ${alert.risk_level === 'CRITICAL' && criticalFlash ? 'critical-flash' : ''}`}>
-        <div className="flex items-start gap-3"><div className={`mt-0.5 rounded-md p-1.5 ${severityStyle[alert.risk_level]}`}><Icon size={14} /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-x-2 gap-y-1"><span className="text-xs font-semibold text-slate-200">{alert.message}</span><span className={`rounded px-1.5 py-0.5 text-[9px] font-bold ${severityStyle[alert.risk_level]}`}>{alert.risk_level}</span></div><div className="mt-1.5 flex items-center justify-between gap-2 text-[10px] text-slate-500"><span className="truncate">{alert.camera_id} <span className="mx-1 text-slate-700">/</span> {alert.alert_type.replace(/_/g, ' ')}</span><time className="shrink-0 font-mono">{new Date(alert.timestamp).toLocaleTimeString()}</time></div></div></div>
-      </li> })}</ul> : <div className="flex min-h-36 flex-col items-center justify-center gap-2 text-slate-600"><Bell size={20} /><p className="text-xs">No events match these filters</p></div>}
+
+  return <section className="panel xl:sticky xl:top-24" aria-labelledby="events-title">
+    <div className="panel-head">
+      <h2 id="events-title" className="panel-title">Events <span className="mono ml-1 text-[12px] font-normal faint">{alerts.length}</span></h2>
+      <div className="flex items-center gap-1">
+        <button onClick={toggleSound} aria-pressed={sound} title={sound ? 'Mute critical alarm' : 'Sound an alarm on critical events'} className={`icon-button ${sound ? 'text-tide' : ''}`}>{sound ? <Volume2 size={15} /> : <VolumeX size={15} />}</button>
+        <button title="Clear the event list" aria-label="Clear the event list" onClick={onClear} className="icon-button"><Trash2 size={15} /></button>
+      </div>
+    </div>
+    <div className="flex gap-2 border-b border-line px-4 py-3">
+      <select aria-label="Show events from camera" value={camera} onChange={e => setCamera(e.target.value)} className="filter-select flex-1">
+        <option value="ALL">All cameras</option>{cameras.map(id => <option key={id} value={id}>{id}</option>)}
+      </select>
+      <select aria-label="Show events of severity" value={severity} onChange={e => setSeverity(e.target.value)} className="filter-select flex-1">
+        <option value="ALL">Any severity</option><option value="CRITICAL">Respond</option><option value="WARNING">Watch</option><option value="NORMAL">Info</option>
+      </select>
+    </div>
+    <div className="max-h-[640px] overflow-auto" data-lenis-prevent>
+      {filtered.length
+        ? <ul>{filtered.map(alert => <li key={`${alert.id}-${alert.risk_level === 'CRITICAL' ? criticalFlash : 0}`}
+            className={`event ${alert.risk_level === 'CRITICAL' ? 'event-critical' : ''} ${alert.risk_level === 'CRITICAL' && criticalFlash ? 'critical-flash' : ''}`}>
+            <div className="flex items-start justify-between gap-3">
+              <p className="text-[14px] font-medium leading-snug">{alert.message}</p>
+              {alert.risk_level !== 'CRITICAL' && <span className={`tag ${levelTag[alert.risk_level]} shrink-0`}>{levelText[alert.risk_level]}</span>}
+            </div>
+            <div className="event-meta mt-1.5 flex justify-between gap-2">
+              <span className="truncate"><span className="mono">{alert.camera_id}</span>, {typeText(alert.alert_type)}</span>
+              <time className="mono shrink-0">{new Date(alert.timestamp).toLocaleTimeString()}</time>
+            </div>
+          </li>)}</ul>
+        : <div className="flex min-h-48 flex-col items-center justify-center gap-2 px-6 text-center faint">
+            <Bell size={18} />
+            <p className="text-[13px]">{alerts.length ? 'No events match these filters.' : 'No events yet. Intrusions, watchlist matches and night movement appear here.'}</p>
+          </div>}
     </div>
   </section>
 }
