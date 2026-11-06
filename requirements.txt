@@ -24,3 +24,8 @@ tensorboard>=2.12     # Required by torchreid's engine imports
 mediapipe>=0.10.14
 pywhatkit>=5.4
 PyYAML>=6.0.1
+
+# Facial recognition uses OpenCV's built-in YuNet + SFace (no extra package).
+# Download the two ONNX models once:  cd Backend && python scripts/download_models.py
+# Optional 512-d FaceNet backend (face_recognition.backend: facenet):
+# facenet-pytorch>=2.5
