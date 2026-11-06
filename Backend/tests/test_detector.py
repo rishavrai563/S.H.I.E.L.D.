@@ -97,21 +97,8 @@ class TestSecurityDetector:
         """High-conf dets go to first list, low-conf to second."""
         from core.detector import SecurityDetector
 
-        # Create mock boxes
-        mock_box_high = MagicMock()
-        mock_box_high.xyxy = [MagicMock()]
-        mock_box_high.xyxy[0].cpu.return_value.tolist.return_value = [10.0, 20.0, 100.0, 200.0]
-        mock_box_high.conf.cpu.return_value = 0.85
-        mock_box_high.cls.cpu.return_value.item.return_value = 0
-
-        mock_box_low = MagicMock()
-        mock_box_low.xyxy = [MagicMock()]
-        mock_box_low.xyxy[0].cpu.return_value.tolist.return_value = [200.0, 200.0, 280.0, 400.0]
-        mock_box_low.conf.cpu.return_value = 0.25
-        mock_box_low.cls.cpu.return_value.item.return_value = 0
-
-        mock_result = MagicMock()
-        mock_result.boxes = [mock_box_high, mock_box_low]
+        mock_result = _fake_result([[10.0, 20.0, 100.0, 200.0, 0.85, 0],
+                                    [200.0, 200.0, 280.0, 400.0, 0.25, 0]])
 
         mock_model = MagicMock()
         mock_model.predict.return_value = [mock_result]
@@ -131,14 +118,7 @@ class TestSecurityDetector:
         """Detections below min_area should be discarded."""
         from core.detector import SecurityDetector
 
-        mock_box = MagicMock()
-        mock_box.xyxy = [MagicMock()]
-        mock_box.xyxy[0].cpu.return_value.tolist.return_value = [10.0, 10.0, 15.0, 15.0]  # area=25
-        mock_box.conf.cpu.return_value = 0.90
-        mock_box.cls.cpu.return_value.item.return_value = 0
-
-        mock_result = MagicMock()
-        mock_result.boxes = [mock_box]
+        mock_result = _fake_result([[10.0, 10.0, 15.0, 15.0, 0.90, 0]])  # area=25
         mock_model = MagicMock()
         mock_model.predict.return_value = [mock_result]
         mock_yolo_cls.return_value = mock_model
@@ -153,16 +133,8 @@ class TestSecurityDetector:
     def test_batch_detect_returns_per_frame(self, mock_yolo_cls):
         from core.detector import SecurityDetector
 
-        mock_box = MagicMock()
-        mock_box.xyxy = [MagicMock()]
-        mock_box.xyxy[0].cpu.return_value.tolist.return_value = [10.0, 20.0, 100.0, 200.0]
-        mock_box.conf.cpu.return_value = 0.90
-        mock_box.cls.cpu.return_value.item.return_value = 0
-
-        mock_result1 = MagicMock()
-        mock_result1.boxes = [mock_box]
-        mock_result2 = MagicMock()
-        mock_result2.boxes = []
+        mock_result1 = _fake_result([[10.0, 20.0, 100.0, 200.0, 0.90, 0]])
+        mock_result2 = _fake_result([])
 
         mock_model = MagicMock()
         mock_model.predict.return_value = [mock_result1, mock_result2]
@@ -182,3 +154,27 @@ class TestSecurityDetector:
         mock_yolo_cls.return_value = MagicMock()
         det = SecurityDetector(model_path="test.pt", device="cpu")
         assert det.batch_detect([]) == []
+
+
+
+def _fake_result(rows):
+    """YOLO-like result whose boxes.data is an (N, 6) array [x1, y1, x2, y2, conf, cls]."""
+    r = MagicMock()
+    r.boxes.data = np.asarray(rows, dtype=np.float64).reshape(-1, 6)
+    return r
+
+
+class TestShapeGrouping:
+    @patch("core.detector.YOLO")
+    def test_mixed_shapes_run_per_shape_and_keep_order(self, mock_yolo_cls):
+        from core.detector import SecurityDetector
+        model = MagicMock()
+        # one predict call per shape group; tag each result with the frame width it saw
+        model.predict.side_effect = lambda imgs, **kw: [
+            _fake_result([[0, 0, 50, 50, 0.9, 0]] * (1 if im.shape[1] == 640 else 2)) for im in imgs]
+        mock_yolo_cls.return_value = model
+        det = SecurityDetector(model_path="t.pt", device="cpu")
+        a, b = np.zeros((480, 640, 3), np.uint8), np.zeros((1080, 960, 3), np.uint8)
+        out = det.batch_detect([a, b, a])
+        assert model.predict.call_count == 2
+        assert [len(h) for h, _ in out] == [1, 2, 1]

@@ -11,6 +11,7 @@ def _fake_tensor(rows, cols):
     arr = np.random.randn(rows, cols).astype(np.float32)
     mock = MagicMock()
     mock.cpu.return_value = mock
+    mock.float.return_value = mock
     mock.detach.return_value = mock
     mock.numpy.return_value = arr
     mock.shape = (rows, cols)
@@ -45,6 +46,7 @@ class TestReIDEncoder:
         mock_extractor = MagicMock()
         raw = _fake_tensor(3, 512)
         mock_extractor.return_value = raw
+        mock_extractor.model.eval.return_value = MagicMock(return_value=raw)
         mock_fe_cls.return_value = mock_extractor
 
         encoder = ReIDEncoder(model_path="x.pth", device="cpu")
@@ -61,6 +63,7 @@ class TestReIDEncoder:
         from core.reid_encoder import ReIDEncoder
         mock_extractor = MagicMock()
         mock_extractor.return_value = _fake_tensor(1, 512)
+        mock_extractor.model.eval.return_value = MagicMock(return_value=mock_extractor.return_value)
         mock_fe_cls.return_value = mock_extractor
 
         encoder = ReIDEncoder(model_path="x.pth", device="cpu")
@@ -87,6 +90,7 @@ class TestReIDEncoder:
         from core.reid_encoder import ReIDEncoder
         mock_extractor = MagicMock()
         mock_extractor.return_value = _fake_tensor(1, 512)
+        mock_extractor.model.eval.return_value = MagicMock(return_value=mock_extractor.return_value)
         mock_fe_cls.return_value = mock_extractor
 
         encoder = ReIDEncoder(model_path="x.pth", device="cpu")

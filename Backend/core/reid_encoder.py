@@ -23,13 +23,7 @@ from typing import List, Optional
 import cv2
 import numpy as np
 
-# Keep torch/torchreid checkpoints inside this checkout by default. This makes
-# first-run model downloads work in restricted home directories and keeps the
-# generated cache easy to exclude from version control.
-os.environ.setdefault(
-    "TORCH_HOME",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".torch_cache"),
-)
+# TORCH_HOME (checkpoint cache) is pointed at Backend/.cache/torch in core/__init__.py.
 
 import torch
 import torchreid
@@ -66,20 +60,33 @@ class ReIDEncoder:
         self.device = device
         self.input_size = (input_width, input_height)  # (W, H) for PIL resize
 
-        # If the weights file doesn't exist on disk, let torchreid auto-download
-        # by passing model_path='' (it will fetch MSMT17 pretrained weights)
+        # Re-ID needs weights trained on person re-identification (MSMT17). If they are
+        # missing, torchreid falls back to ImageNet classification weights, which work
+        # but match people across cameras far less reliably -- warn loudly.
         effective_path = model_path if os.path.isfile(model_path) else ''
-        
+
         if effective_path:
-            print(f"  [ReID] Loading weights from {model_path}")
+            print(f"  [ReID] Loading re-ID weights from {model_path}")
         else:
-            print(f"  [ReID] Weights not found at {model_path} — auto-downloading pretrained {model_name}...")
+            print(f"  [ReID] WARNING: {model_path} not found -- using ImageNet {model_name} weights. "
+                  f"Cross-camera matching will be weak. Run: python scripts/download_models.py")
         
         self.extractor = torchreid.utils.FeatureExtractor(
             model_name=model_name,
             model_path=effective_path,
             device=device,
         )
+
+        # Fast path: batched GPU preprocessing + FP16 inference on the underlying model
+        # (torchreid's extractor converts every crop to PIL and normalises on the CPU).
+        self._model = self.extractor.model.eval()
+        self._torch_device = torch.device(device)
+        self._half = str(device).startswith("cuda") and torch.cuda.is_available()
+        if self._half:
+            self._model.half()
+        dtype = torch.float16 if self._half else torch.float32
+        self._mean = torch.tensor([0.485, 0.456, 0.406], device=self._torch_device, dtype=dtype).view(1, 3, 1, 1) * 255
+        self._std = torch.tensor([0.229, 0.224, 0.225], device=self._torch_device, dtype=dtype).view(1, 3, 1, 1) * 255
 
     def extract(self, crop_bgr: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -136,11 +143,14 @@ class ReIDEncoder:
             resized = cv2.resize(rgb, (self.input_size[0], self.input_size[1]))  # (W, H)
             processed.append(resized)
         
-        # Single GPU forward pass — torchreid expects list of numpy arrays
-        with torch.no_grad():
-            features = self.extractor(processed)  # (N_valid, 512) tensor
-        
-        features = features.cpu().numpy().astype(np.float32)
+        # Single GPU forward pass: one upload, normalise on the GPU, FP16 on CUDA
+        with torch.inference_mode():
+            x = torch.from_numpy(np.stack(processed)).to(self._torch_device, non_blocking=True)
+            x = x.permute(0, 3, 1, 2).to(self._mean.dtype)
+            x = (x - self._mean) / self._std
+            features = self._model(x)
+
+        features = features.float().cpu().numpy().astype(np.float32)
         
         # L2 normalize each embedding
         norms = np.linalg.norm(features, axis=1, keepdims=True)

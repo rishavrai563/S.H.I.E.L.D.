@@ -63,6 +63,17 @@ class SecurityDetector:
                  imgsz: int = 640):
         self.model = YOLO(model_path)
         self.model.to(device)
+        self.device = device
+        # FP16 inference on GPU: ~2x faster, half the VRAM. Ultralytics >= 8.4
+        # replaced `half=True` with `quantize=16`; pick whichever this version knows.
+        self._precision_kwargs = {}
+        if device == "cuda":
+            try:
+                from ultralytics.cfg import DEFAULT_CFG_DICT
+                new_api = "quantize" in DEFAULT_CFG_DICT
+            except Exception:
+                new_api = False
+            self._precision_kwargs = {"quantize": 16} if new_api else {"half": True}
         self.high_conf = high_conf
         self.low_conf = low_conf
         self.min_area = min_area
@@ -75,42 +86,7 @@ class SecurityDetector:
         Returns:
             (high_confidence_detections, low_confidence_detections)
         """
-        results = self.model.predict(
-            frame,
-            classes=CLASS_IDS,         # Ingest persons + all vehicle classes
-            conf=self.low_conf,
-            iou=self.nms_iou,
-            imgsz=self.imgsz,
-            verbose=False,
-        )
-
-        high_dets: List[Detection] = []
-        low_dets: List[Detection] = []
-
-        if results and len(results) > 0:
-            result = results[0]
-            for box in result.boxes:
-                bbox = tuple(box.xyxy[0].cpu().tolist())
-                conf = float(box.conf.cpu())
-                cls_id = int(box.cls.cpu().item())
-                label = TARGET_CLASSES.get(cls_id, "unknown")
-
-                det = Detection(
-                    bbox=bbox,
-                    confidence=conf,
-                    class_id=cls_id,
-                    label=label
-                )
-
-                if det.area() < self.min_area:
-                    continue
-
-                if conf >= self.high_conf:
-                    high_dets.append(det)
-                else:
-                    low_dets.append(det)
-
-        return high_dets, low_dets
+        return self.batch_detect([frame])[0]
 
     def batch_detect(self, frames: List[np.ndarray]) -> List[Tuple[List[Detection], List[Detection]]]:
         """
@@ -119,42 +95,41 @@ class SecurityDetector:
         if not frames:
             return []
 
-        results = self.model.predict(
-            frames,
-            classes=CLASS_IDS,
-            conf=self.low_conf,
-            iou=self.nms_iou,
-            imgsz=self.imgsz,
-            verbose=False,
-        )
+        # Frames of different shapes in one batch are all padded to an imgsz x imgsz
+        # square; same-shape groups keep a tight rectangle (~1.7x less work for 16:9).
+        groups: Dict[Tuple[int, int], List[int]] = {}
+        for i, f in enumerate(frames):
+            groups.setdefault(tuple(f.shape[:2]), []).append(i)
 
-        all_dets: List[Tuple[List[Detection], List[Detection]]] = []
-
-        for result in results:
-            high_dets: List[Detection] = []
-            low_dets: List[Detection] = []
-
-            for box in result.boxes:
-                bbox = tuple(box.xyxy[0].cpu().tolist())
-                conf = float(box.conf.cpu())
-                cls_id = int(box.cls.cpu().item())
-                label = TARGET_CLASSES.get(cls_id, "unknown")
-
-                det = Detection(
-                    bbox=bbox,
-                    confidence=conf,
-                    class_id=cls_id,
-                    label=label
-                )
-
-                if det.area() < self.min_area:
-                    continue
-
-                if conf >= self.high_conf:
-                    high_dets.append(det)
-                else:
-                    low_dets.append(det)
-
-            all_dets.append((high_dets, low_dets))
-
+        all_dets: List[Tuple[List[Detection], List[Detection]]] = [([], []) for _ in frames]
+        for idx in groups.values():
+            results = self.model.predict(
+                [frames[i] for i in idx],
+                classes=CLASS_IDS,
+                conf=self.low_conf,
+                iou=self.nms_iou,
+                imgsz=self.imgsz,
+                device=self.device,
+                **self._precision_kwargs,
+                verbose=False,
+            )
+            for i, result in zip(idx, results):
+                all_dets[i] = self._parse(result)
         return all_dets
+
+    def _parse(self, result) -> Tuple[List[Detection], List[Detection]]:
+        """Split one YOLO result into (high, low) detections.
+
+        All boxes are copied GPU->CPU in one transfer: rows of [x1, y1, x2, y2, conf, cls].
+        """
+        high_dets: List[Detection] = []
+        low_dets: List[Detection] = []
+        data = result.boxes.data
+        rows = data.cpu().numpy() if hasattr(data, "cpu") else np.asarray(data)
+        for x1, y1, x2, y2, conf, cls_id in rows.tolist():
+            det = Detection(bbox=(x1, y1, x2, y2), confidence=conf, class_id=int(cls_id),
+                            label=TARGET_CLASSES.get(int(cls_id), "unknown"))
+            if det.area() < self.min_area:
+                continue
+            (high_dets if conf >= self.high_conf else low_dets).append(det)
+        return high_dets, low_dets

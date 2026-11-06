@@ -8,18 +8,22 @@ system:
 
 # ── Detection (YOLOv11m) ──────────────────────────────────
 detection:
-  model_path: "models/yolo11m.pt"
+  # Speed profile (RTX 3050, measured):  yolo11s @640 = 78 FPS on 1 cam / 45 FPS per cam x4
+  #   yolo11s @960 = 67 / 24   yolo11m @960 = 43 / 13 (most far-range detail)
+  model_path: "models/yolo11s.pt"
   high_conf: 0.40                 # High-confidence threshold (allow more new persons)
   low_conf: 0.07                  # Low-confidence threshold (better recall in crowds)
   min_area: 120                   # Minimum bbox area in px² (don't drop far persons)
   nms_iou: 0.75                   # More permissive NMS for close/overlapping people
-  imgsz: 1280                     # Strong-detail mode: slower but better person features
+  imgsz: 640                      # 640 = fastest; raise to 960 for distant / small people
   person_class: 0                 # COCO class ID for person
 
 # ── Re-ID (OSNet_x1_0) ───────────────────────────────────
 reid:
-  model_name: "osnet_x1_0"
-  model_path: "models/osnet_x1_0_msmt17.pth"
+  # OSNet-AIN trained for person re-identification on MSMT17 (cross-camera robust).
+  # Measured on cam2_crowd: rank-1 97.9% vs 87.6% for the ImageNet-only weights.
+  model_name: "osnet_ain_x1_0"
+  model_path: "models/osnet_ain_x1_0_msmt17.pth"
   embedding_dim: 512
   input_width: 128
   input_height: 256
@@ -63,6 +67,9 @@ tracker:
 global_matcher:
   match_threshold: 0.70           # Min cosine similarity for gallery match
   margin_threshold: 0.08          # Min gap between top-1 and top-2 scores
+  cross_camera_match_threshold: 0.78  # stricter for hand-off between cameras (wrong merge > new ID)
+  cross_camera_margin: 0.10
+  defer_matching: false           # true = decide every re-ID from multi-frame embedding (dense crowds)
   registration_threshold: 0.70    # Min similarity to match registered person
   ema_alpha: 0.10                 # Prototype update rate (conservative)
   ema_min_confidence: 0.65        # Only update prototype if match conf >= this
@@ -73,11 +80,16 @@ global_matcher:
 stream:
   jpeg_quality: 70                # MJPEG encoding quality (0-100)
   target_fps: 30                  # Target processing FPS
+  display_fps: 30                 # dashboard video rate (independent of analysis; capped by camera)
+  display_max_dim: 1280           # downscale dashboard video to this (saves CPU + bandwidth)
+  overlay_max_age_sec: 1.5        # hide boxes if analysis stalls longer than this
 
 # ── Runtime tuning ────────────────────────────────────────
 runtime:
+  pipeline: true                  # YOLO runs on its own thread, overlapped with tracking/Re-ID
+  metrics_window_sec: 3.0         # FPS / latency shown on the dashboard = rolling average over this
   process_max_dim: 960            # Keep more pixels for stronger feature extraction
-  reid_every_n_frames: 1          # ReID every frame for stronger identity consistency
+  reid_every_n_frames: 3          # full Re-ID pass every N frames; new / crowded people every frame
   detection_event_cooldown_sec: 3.0  # Suppress repeated TRACK_ACTIVATED logs/events
   global_match_threshold: 0.70    # Cosine threshold for global ID match
   global_min_track_age: 4         # Only assign global ID when stable enough
@@ -105,6 +117,78 @@ risk:
   frequent_entry_exit_count: 6     # 6 entries in 120s = suspicious
   min_track_age_sec: 15            # Track must live ≥15s before alert
   min_concurrent_flags: 2          # ≥2 flag types active simultaneously for alert
+
+# ── Facial Recognition System (FRS) ───────────────────────
+face_recognition:
+  enabled: true
+  backend: "auto"                 # auto | sface (OpenCV, 128-d) | facenet (facenet-pytorch, 512-d)
+  detector_model: "models/face_detection_yunet_2023mar.onnx"
+  recognizer_model: "models/face_recognition_sface_2021dec.onnx"
+  gallery_path: "data/face_gallery.json"
+  match_distance_threshold: 0.60  # cosine distance (1 - similarity); match if <= this
+  margin: 0.05                    # best identity must beat runner-up by this similarity margin
+  min_face_px: 28                 # ignore faces smaller than this (too blurry to identify)
+  detector_score_threshold: 0.80
+  check_interval_sec: 0.5         # per-track recognition rate limit
+  confirm_hits: 2                 # consecutive matches before alerting
+  recheck_sec: 30.0               # re-verify a confirmed identity after this long
+
+# ── ANPR ──────────────────────────────────────────────────
+anpr:
+  enabled: true
+  plate_format: "IN"              # "IN" = Indian position-aware correction; "" = generic
+  require_valid_format: false     # true = drop reads that don't match the national format
+  min_plate_chars: 5
+  max_plate_chars: 11
+  ocr_confidence_threshold: 0.20
+  early_accept_confidence: 0.60   # stop multi-pass OCR once a valid read beats this
+  plate_aspect_ratio: [2.5, 5.0]  # localisation contour filter (width:height)
+  temporal_votes_required: 2      # concordant reads before a plate is confirmed
+  temporal_window_size: 12        # attempts before the vote window resets
+  ocr_interval_sec: 0.25          # per-vehicle OCR rate limit
+  min_vehicle_width_px: 60
+  max_vehicles_per_frame: 3       # OCR budget per camera per frame (largest first)
+  async_ocr: true                 # run OCR on a background thread (keeps video real-time on GPU)
+  async_queue_size: 8             # max vehicle crops waiting for OCR; extras retried next frame
+  max_ocr_per_sec: 8              # global plate-read budget (OCR shares the GPU with detection)
+  max_attempts_per_vehicle: 24    # stop retrying a vehicle whose plate stays unreadable
+  watchlist_path: "data/plate_watchlist.json"
+  watchlist_max_edit_distance: 1.0  # OCR-confusion-weighted (0↔O, 1↔I, 8↔B cost 0.3)
+  vehicle_iou_threshold: 0.25
+  vehicle_max_age_sec: 2.0
+
+# ── Night vision ──────────────────────────────────────────
+night_vision:
+  mode: "auto"                    # auto (clock OR dark scene) | clock | luminance | on | off
+                                  # per-camera override: add `night_mode: on` to a camera in cameras.yaml
+  night_start_hour: 18
+  night_end_hour: 6
+  dark_luma_enter: 70             # mean luma (0-255) below which the scene is "dark"
+  dark_luma_exit: 90
+  luma_check_every_n: 15
+  clahe_clip_limit: 2.5
+
+# ── Alert cooldowns ───────────────────────────────────────
+alerts:
+  behaviour_cooldown_sec: 60      # per track per label (INTRUSION / LOITERING / SUSPICIOUS_MOTION)
+  face_match_cooldown_sec: 60     # per identity per camera
+  night_movement_cooldown_sec: 30 # per camera
+  plate_watchlist_cooldown_sec: 120
+
+# ── Logging ───────────────────────────────────────────────
+logging:
+  events_log: "logs/events.jsonl"         # persistent alert log (never cleared, size-rotated)
+  frame_log: "logs/frame_risk_output.jsonl"
+  frame_log_enabled: true
+  frame_log_every_n: 1
+
+# ── Command & Control integration ─────────────────────────
+integrations:
+  site_id: "BOP-01"                # stamped on every alert
+  webhook:
+    url: ""                        # e.g. "http://cnc.local/api/alerts" — JSON POST per alert
+    min_severity: "WARNING"        # NORMAL | WARNING | CRITICAL
+    headers: {}                    # e.g. {Authorization: "Bearer <token>"}
 
 # ── Zones (pixel coordinates for current camera framing) ─
 zones:

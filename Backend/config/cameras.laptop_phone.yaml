@@ -1,0 +1,45 @@
+# SHIELD: two live cameras, laptop webcam + phone (IP Webcam), with cross-camera tracking.
+#
+#   1. Phone: turn on Mobile Hotspot. Laptop: join that hotspot (campus Wi-Fi blocks
+#      phone <-> laptop traffic). In IP Webcam tap "Start server" and read the IPv4 address.
+#   2. Put that address in cam2 below, then test it:
+#        ..\venv\Scripts\python.exe scripts\check_camera.py http://<phone-ip>:8080/video
+#   3. Start:
+#        ..\venv\Scripts\python.exe run_shield.py --api --device cuda --cameras config/cameras.laptop_phone.yaml
+#
+# A person walking from the laptop's view into the phone's view keeps the same G-number.
+# For about half a second after entering the second camera they may show a temporary
+# number, then switch to their real one; the event feed shows "G5 moved Laptop -> Phone".
+#
+# Tips for reliable hand-off:
+#   * Both cameras should see the person's body (not just a face at the laptop):
+#     tilt the laptop screen back or step back so torso + legs are visible.
+#   * Similar lighting on both cameras helps; avoid strong backlight.
+#   * Clothing is the main cue: two people in identical clothes may swap IDs.
+
+cameras:
+  - camera_id: "cam1"
+    name: "Laptop"
+    source: 0
+    width: 1280
+    height: 720
+
+  - camera_id: "cam2"
+    name: "Phone"
+    source: "http://10.122.102.58:8080/video"   # <-- IPv4 shown in IP Webcam (+ /video)
+    rotate: 90       # phone held upright; use 0 if held in landscape, 270 if upside down
+
+# Overrides of config.yaml for this setup only
+settings:
+  global_matcher:
+    # Laptop and phone may watch the same room: a person can be on both at once
+    # and can move between them in under a second, so no minimum transit time.
+    cross_camera_min_gap: 0
+    # Webcam (close, upper body) vs phone (wider) views differ more than two CCTV
+    # cameras; slightly lower bar, margin still protects against confusing 2 people.
+    cross_camera_match_threshold: 0.74
+    cross_camera_margin: 0.08
+  runtime:
+    global_rematch_frames: 90       # keep trying to recognise a newcomer for ~3-4 s
+  stream:
+    display_fps: 30

@@ -25,7 +25,10 @@ def load_config() -> dict:
 
 def load_camera_configs() -> list:
     """Reads cameras.yaml to build the camera architecture."""
-    cam_path = os.path.join(os.path.dirname(__file__), "config", "cameras.yaml")
+    # --cameras / SHIELD_CAMERAS selects another topology file (e.g. config/cameras.live.yaml)
+    cam_path = os.environ.get("SHIELD_CAMERAS") or os.path.join(os.path.dirname(__file__), "config", "cameras.yaml")
+    if not os.path.isabs(cam_path):
+        cam_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), cam_path)
     with open(cam_path, "r") as f:
         cam_data = yaml.safe_load(f)
 
@@ -38,6 +41,12 @@ def load_camera_configs() -> list:
                 name=cam.get("name", "Unknown Node"),
                 gps_lat=cam.get("gps_lat", 0.0),
                 gps_lng=cam.get("gps_lng", 0.0),
+                night_mode=str(cam.get("night_mode", "")),
+                width=int(cam.get("width", 0) or 0),
+                height=int(cam.get("height", 0) or 0),
+                loop=bool(cam.get("loop", False)),
+                rotate=int(cam.get("rotate", 0) or 0),
+                realtime=bool(cam.get("realtime", False)),
             )
         )
     return configs
@@ -68,6 +77,29 @@ def run_cli_mode(config: dict, camera_configs: list):
         print("Shutting down data streams...")
 
 
+def _deep_merge(base: dict, extra: dict) -> None:
+    for k, v in (extra or {}).items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+
+
+def apply_camera_file_settings(config: dict) -> None:
+    """A camera topology file may carry a `settings:` block that overrides config.yaml
+    for that setup (e.g. overlapping laptop + phone views need cross_camera_min_gap: 0)."""
+    cam_path = os.environ.get("SHIELD_CAMERAS")
+    if not cam_path:
+        return
+    if not os.path.isabs(cam_path):
+        cam_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), cam_path)
+    with open(cam_path, "r") as f:
+        data = yaml.safe_load(f) or {}
+    if data.get("settings"):
+        _deep_merge(config, data["settings"])
+        print(f"  [CONFIG] {os.path.basename(cam_path)} overrides: {', '.join(data['settings'])}")
+
+
 def run_api_mode(config: dict):
     """API server mode — starts FastAPI with uvicorn (headless, no OpenCV windows)."""
     print("⚙️ Initializing SHIELD Enterprise Architecture (API Mode)...")
@@ -90,6 +122,7 @@ Examples:
   python run_shield.py          # CLI mode with OpenCV display
   python run_shield.py --api    # API server mode (headless)
   python run_shield.py --api --port 9000   # API on custom port
+  python run_shield.py --api --cameras config/cameras.live.yaml   # phones + webcam
         """,
     )
     parser.add_argument(
@@ -110,6 +143,12 @@ Examples:
         help="Override the API server host (default: from config.yaml)",
     )
     parser.add_argument(
+        "--cameras",
+        type=str,
+        default=None,
+        help="Camera topology YAML (default: config/cameras.yaml), e.g. config/cameras.live.yaml",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -119,8 +158,12 @@ Examples:
 
     args = parser.parse_args()
 
+    if args.cameras:
+        os.environ["SHIELD_CAMERAS"] = args.cameras
+
     # Load configuration
     config = load_config()
+    apply_camera_file_settings(config)
 
     # Apply CLI overrides
     if args.device:
