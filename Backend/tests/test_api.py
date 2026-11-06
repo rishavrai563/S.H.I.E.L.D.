@@ -208,3 +208,195 @@ class TestFenceEndpoints:
         })
         assert resp.status_code == 200
         mock_analyzer.update_fence.assert_called_once()
+
+
+# ═══════════════════════════════════════════════════════════
+#  FRS / ANPR / Event-log endpoints
+# ═══════════════════════════════════════════════════════════
+import base64
+import cv2
+from types import SimpleNamespace
+
+
+def b64_image(img):
+    ok, buf = cv2.imencode(".jpg", img)
+    return base64.b64encode(buf.tobytes()).decode()
+
+
+@pytest.fixture
+def analytics(client, tmp_path):
+    """Attach real FRS (fake nets), ANPR (fake OCR) and AlertManager to the API state."""
+    from api import state
+    from core.alerts import AlertManager
+    from core.anpr import ANPREngine
+    from tests.test_face_auth import make_engine
+    from tests.test_anpr import FakeReader
+
+    face = make_engine(tmp_path)
+    anpr = ANPREngine(reader=FakeReader("MHO1AB1234", 0.9), watchlist_path=str(tmp_path / "wl.json"))
+    alerts = AlertManager(events_log_path=str(tmp_path / "events.jsonl"))
+    state.orchestrator = SimpleNamespace(face_auth=face, anpr_engine=anpr, alert_manager=alerts)
+    yield state.orchestrator
+    state.orchestrator = None
+
+
+RED = np.full((200, 160, 3), (20, 20, 230), np.uint8)
+
+
+class TestFaceEndpoints:
+    def test_enroll_requires_pipeline(self, client):
+        from api import state
+        state.orchestrator = None
+        assert client.post("/api/v1/faces/enroll", json={"name": "A", "image": b64_image(RED)}).status_code == 503
+
+    def test_enroll_list_search_delete(self, client, analytics):
+        r = client.post("/api/v1/faces/enroll", json={"name": "Suspect", "image": b64_image(RED),
+                                                     "category": "wanted", "notes": "n"})
+        assert r.status_code == 200, r.text
+        ident = r.json()["identity"]
+        assert ident["category"] == "WANTED" and ident["references_added"] == 1
+
+        g = client.get("/api/v1/faces/gallery").json()
+        assert g["total"] == 1 and g["identities"][0]["thumbnail"]
+
+        s = client.post("/api/v1/faces/search", json={"image": b64_image(RED)}).json()
+        assert s["faces"][0]["match"]["name"] == "Suspect"
+
+        assert client.delete(f"/api/v1/faces/{ident['identity_id']}").status_code == 200
+        assert client.delete(f"/api/v1/faces/{ident['identity_id']}").status_code == 404
+
+    def test_enroll_data_url_and_multiple_images(self, client, analytics):
+        data_url = "data:image/jpeg;base64," + b64_image(RED)
+        r = client.post("/api/v1/faces/enroll", json={"name": "A", "images": [data_url, b64_image(RED)]})
+        assert r.json()["identity"]["num_references"] == 2
+
+    def test_enroll_validation_errors(self, client, analytics):
+        assert client.post("/api/v1/faces/enroll", json={"name": "A"}).status_code == 400
+        assert client.post("/api/v1/faces/enroll", json={"name": "A", "image": "@@@"}).status_code == 400
+        black = b64_image(np.zeros((100, 100, 3), np.uint8))
+        assert client.post("/api/v1/faces/enroll", json={"name": "A", "image": black}).status_code == 422
+        bad_cat = client.post("/api/v1/faces/enroll", json={"name": "A", "image": b64_image(RED), "category": "X"})
+        assert bad_cat.status_code == 422
+
+
+class TestAnprEndpoints:
+    def test_watchlist_crud(self, client, analytics):
+        before = client.get("/api/v1/anpr/watchlist").json()["total"]
+        r = client.post("/api/v1/anpr/watchlist", json={"plate": "gj-05 ab 7777", "tag": "stolen", "notes": "x"})
+        assert r.status_code == 200 and r.json()["plate"] == "GJ05AB7777"
+        items = {w["plate"]: w for w in client.get("/api/v1/anpr/watchlist").json()["watchlist"]}
+        assert len(items) == before + 1 and items["GJ05AB7777"]["tag"] == "STOLEN"
+        assert client.delete("/api/v1/anpr/watchlist/GJ05AB7777").status_code == 200
+        assert client.delete("/api/v1/anpr/watchlist/GJ05AB7777").status_code == 404
+        assert client.post("/api/v1/anpr/watchlist", json={"plate": "A1"}).status_code == 400
+
+    def test_recognize(self, client, analytics):
+        from tests.test_anpr import synthetic_vehicle
+        r = client.post("/api/v1/anpr/recognize", json={"image": b64_image(synthetic_vehicle())})
+        assert r.status_code == 200
+        assert r.json()["result"]["plate"] == "MH01AB1234"
+
+    def test_recent_plates(self, client, analytics):
+        from tests.test_anpr import synthetic_vehicle
+        car = synthetic_vehicle()
+        analytics.anpr_engine.extract_plate_with_voting(car, "cam1:1", now=0)
+        analytics.anpr_engine.extract_plate_with_voting(car, "cam1:1", now=1, camera_id="cam1")
+        plates = client.get("/api/v1/anpr/plates").json()["plates"]
+        assert plates[0]["plate"] == "MH01AB1234" and plates[0]["camera_id"] == "cam1"
+
+    def test_anpr_disabled(self, client, analytics):
+        analytics.anpr_engine = None
+        assert client.get("/api/v1/anpr/watchlist").status_code == 503
+
+
+class TestEventLog:
+    def test_events_endpoint(self, client, analytics):
+        am = analytics.alert_manager
+        am.publish([am.make_alert("INTRUSION", "cam1", "CRITICAL", "x"), am.make_alert("LOITERING", "cam1", "WARNING", "y")])
+        ev = client.get("/api/v1/events").json()
+        assert ev["total"] == 2 and ev["events"][0]["type"] == "LOITERING"
+        only = client.get("/api/v1/events?alert_type=INTRUSION").json()
+        assert [e["type"] for e in only["events"]] == ["INTRUSION"]
+
+
+class TestDisplayCompositor:
+    def test_overlay_drawn_on_newer_frame(self):
+        import threading, time as _t
+        from unittest.mock import MagicMock
+        import cv2
+        from api import ShieldState, display_worker
+        st = ShieldState()
+        st.config = {"stream": {"display_fps": 50, "display_max_dim": 2000}}
+        raw = np.zeros((40, 60, 3), np.uint8)
+        ann = raw.copy(); ann[5:10, 5:10] = (0, 0, 255)          # a red "box"
+        newer = np.full((40, 60, 3), 100, np.uint8)               # camera moved on
+        stream = MagicMock(); stream.latest_display.return_value = (newer, _t.time(), 1)
+        st.orchestrator = MagicMock(); st.orchestrator.stream_manager.streams = {"cam1": stream}
+        st.set_overlay("cam1", raw, ann)
+        st.running = True
+        th = threading.Thread(target=display_worker, args=(st,), daemon=True); th.start()
+        deadline = _t.time() + 3
+        while st.get_latest_frame("cam1") is None and _t.time() < deadline:
+            _t.sleep(0.01)
+        st.running = False; th.join(2)
+        img = cv2.imdecode(np.frombuffer(st.get_latest_frame("cam1")[0], np.uint8), cv2.IMREAD_COLOR)
+        assert img[7, 7, 2] > 200 and img[7, 7, 0] < 60         # overlay copied
+        assert abs(int(img[30, 40, 0]) - 100) < 10               # rest is the newer frame
+
+
+class TestDrawnFenceAPI:
+    def _orch(self, tmp_path):
+        from api import state
+        from core.behavior_risk import RiskAnalyzer
+        from core.orchestrator import Orchestrator
+        orch = MagicMock()
+        orch.risk_analyzers = {"cam1": RiskAnalyzer(frame_width=1280, frame_height=720)}
+        orch._fences_path = str(tmp_path / "fences.json")
+        orch.ignore_zones = {}
+        orch.save_fences = lambda: Orchestrator.save_fences(orch)
+        state.orchestrator = orch
+        return orch
+
+    def test_zone_saved_read_back_and_persisted(self, client, tmp_path):
+        import json
+        orch = self._orch(tmp_path)
+        pts = [[100, 100], [600, 120], [500, 600], [150, 500]]
+        r = client.post("/api/v1/fence/config", json={"camera_id": "cam1", "type": "zone", "points": pts})
+        assert r.status_code == 200
+        got = client.get("/api/v1/fence/cam1").json()
+        assert got["type"] == "zone" and got["points"] == pts and got["frame"] == {"width": 1280, "height": 720}
+        assert json.load(open(orch._fences_path))["cam1"]["points"] == pts
+
+    def test_zone_needs_three_points(self, client, tmp_path):
+        self._orch(tmp_path)
+        r = client.post("/api/v1/fence/config", json={"camera_id": "cam1", "type": "zone", "points": [[0, 0], [9, 9]]})
+        assert r.status_code == 400
+
+    def test_bad_type_and_unknown_camera(self, client, tmp_path):
+        self._orch(tmp_path)
+        assert client.post("/api/v1/fence/config", json={"type": "circle", "points": [[0, 0], [5, 5]]}).status_code == 400
+        assert client.get("/api/v1/fence/nope").status_code == 404
+
+    def test_empty_points_disables(self, client, tmp_path):
+        self._orch(tmp_path)
+        assert client.post("/api/v1/fence/config", json={"camera_id": "cam1", "points": []}).status_code == 200
+        assert client.get("/api/v1/fence/cam1").json()["points"] == []
+
+
+def test_ignore_zone_api(client, tmp_path):
+    from api import state
+    from core.behavior_risk import RiskAnalyzer
+    from core.orchestrator import Orchestrator
+    orch = MagicMock()
+    orch.risk_analyzers = {"cam1": RiskAnalyzer(frame_width=1280, frame_height=720)}
+    orch.ignore_zones = {}
+    orch._fences_path = str(tmp_path / "f.json")
+    orch.set_ignore_zones = lambda c, z: Orchestrator.set_ignore_zones(orch, c, z)
+    orch.save_fences = lambda: Orchestrator.save_fences(orch)
+    state.orchestrator = orch
+    zone = [[400, 0], [880, 0], [880, 110], [400, 110]]
+    assert client.post("/api/v1/fence/ignore", json={"camera_id": "cam1", "zones": [zone]}).status_code == 200
+    assert client.get("/api/v1/fence/cam1").json()["ignore"] == [zone]
+    assert client.post("/api/v1/fence/ignore", json={"camera_id": "cam1", "zones": [[[0, 0], [1, 1]]]}).status_code == 400
+    assert client.post("/api/v1/fence/ignore", json={"camera_id": "cam1", "zones": []}).status_code == 200
+    assert client.get("/api/v1/fence/cam1").json()["ignore"] == []

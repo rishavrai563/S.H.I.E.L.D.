@@ -57,7 +57,10 @@ def load_config() -> dict:
 
 def load_camera_configs() -> List[CameraConfig]:
     """Load camera configurations from cameras.yaml."""
-    cam_path = os.path.join(os.path.dirname(__file__), "config", "cameras.yaml")
+    # --cameras / SHIELD_CAMERAS selects another topology file (e.g. config/cameras.live.yaml)
+    cam_path = os.environ.get("SHIELD_CAMERAS") or os.path.join(os.path.dirname(__file__), "config", "cameras.yaml")
+    if not os.path.isabs(cam_path):
+        cam_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), cam_path)
     with open(cam_path, "r") as f:
         cam_data = yaml.safe_load(f)
 
@@ -70,6 +73,12 @@ def load_camera_configs() -> List[CameraConfig]:
                 name=cam.get("name", "Unknown Node"),
                 gps_lat=cam.get("gps_lat", 0.0),
                 gps_lng=cam.get("gps_lng", 0.0),
+                night_mode=str(cam.get("night_mode", "")),
+                width=int(cam.get("width", 0) or 0),
+                height=int(cam.get("height", 0) or 0),
+                loop=bool(cam.get("loop", False)),
+                rotate=int(cam.get("rotate", 0) or 0),
+                realtime=bool(cam.get("realtime", False)),
             )
         )
     return configs
@@ -101,6 +110,10 @@ class ShieldState:
 
         # Annotated frame buffer: camera_id → (jpeg_bytes, timestamp)
         self._frame_buffer: Dict[str, Tuple[bytes, float]] = {}
+        # Latest analysis overlay per camera: (raw_frame, annotated_frame, timestamp)
+        self._overlays: Dict[str, Tuple[np.ndarray, np.ndarray, float]] = {}
+        self._overlay_lock = threading.Lock()
+        self.display_times: Dict[str, Deque[float]] = {}
         self._frame_lock = threading.Lock()
 
         # Lifecycle
@@ -134,6 +147,21 @@ class ShieldState:
         with self._frame_lock:
             self._frame_buffer[camera_id] = (jpeg_buf.tobytes(), time.time())
 
+    def set_overlay(self, camera_id: str, raw: np.ndarray, annotated: np.ndarray) -> None:
+        """Called from the ML thread after each analysis: cheap, no encoding."""
+        with self._overlay_lock:
+            self._overlays[camera_id] = (raw, annotated, time.time())
+
+    def get_overlay(self, camera_id: str):
+        with self._overlay_lock:
+            return self._overlays.get(camera_id)
+
+    def display_fps(self, camera_id: str) -> float:
+        q = self.display_times.get(camera_id)
+        if not q or len(q) < 2 or time.time() - q[-1] > 2.0:
+            return 0.0
+        return round((len(q) - 1) / max(1e-6, q[-1] - q[0]), 1)
+
     def get_latest_frame(self, camera_id: str) -> Optional[Tuple[bytes, float]]:
         """Get the latest JPEG frame for a camera."""
         with self._frame_lock:
@@ -154,8 +182,8 @@ state = ShieldState()
 
 class APIOrchestrator(Orchestrator):
     """
-    Extends Orchestrator to push annotated frames to the API state buffer.
-    Overrides run() to operate headlessly and push frames to the API layer.
+    Headless Orchestrator that publishes annotated frames to the API buffer.
+    The analytics pipeline itself lives in Orchestrator.process_frames().
     """
 
     def __init__(self, cameras, device, shared_state: ShieldState):
@@ -167,149 +195,89 @@ class APIOrchestrator(Orchestrator):
             config=shared_state.config,
         )
         self._shared_state = shared_state
-        self._stop_event = threading.Event()
 
-    def stop(self):
-        """Signal the orchestrator to stop."""
-        self._stop_event.set()
+    def _on_frames(self, annotated_frames: Dict[str, np.ndarray]) -> bool:
+        raw = self.last_raw_frames
+        for cam_id, frame in annotated_frames.items():
+            if cam_id in raw:
+                self._shared_state.set_overlay(cam_id, raw[cam_id], frame)
+            else:
+                self._shared_state.push_annotated_frame(cam_id, frame)
+        return True
 
     def run(self) -> None:
-        """Overridden run loop that pushes annotated frames to the state buffer."""
-        self.stream_manager.start_all()
-        self._start_time = time.time()
-
-        print("\n🎬 SHIELD API Orchestrator Active...\n")
-
         try:
-            while not self._stop_event.is_set():
-                frame_data = self.stream_manager.grab_latest()
-                if not frame_data:
-                    if self.stream_manager.all_stopped():
-                        break
-                    time.sleep(0.01)
-                    continue
-
-                self._frame_count += 1
-                loop_ts = time.time() - self._start_time
-
-                telemetry = {
-                    "timestamp": time.time(),
-                    "frame": self._frame_count,
-                    "alerts": [],
-                    "streams": {},
-                }
-
-                cam_ids_ordered = list(frame_data.keys())
-                frames_list = [frame_data[cid][0] for cid in cam_ids_ordered]
-
-                all_detections = self.detector.batch_detect(frames_list)
-
-                for cam_idx, cam_id in enumerate(cam_ids_ordered):
-                    frame = frames_list[cam_idx]
-                    fh, fw = frame.shape[:2]
-                    annotated = frame.copy()
-
-                    high_dets, low_dets = all_detections[cam_idx]
-
-                    person_high = [d for d in high_dets if not d.is_vehicle()]
-                    person_low = [d for d in low_dets if not d.is_vehicle()]
-                    vehicle_high = [d for d in high_dets if d.is_vehicle()]
-
-                    # --- ANPR PROCESSING ---
-                    for v_det in vehicle_high:
-                        x1, y1, x2, y2 = [int(v) for v in v_det.bbox]
-                        crop = frame[max(0, y1):min(fh, y2), max(0, x1):min(fw, x2)]
-
-                        plate_text, conf = self.anpr_engine.extract_plate(crop)
-
-                        if plate_text and plate_text not in self.plate_memory:
-                            self.plate_memory.add(plate_text)
-                            telemetry["alerts"].append({
-                                "type": "VEHICLE_DETECTED",
-                                "plate": plate_text,
-                                "camera": cam_id,
-                            })
-
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 255, 0), 2)
-                        display_text = f"PLATE: {plate_text}" if plate_text else "VEHICLE"
-                        cv2.putText(annotated, display_text, (x1, y1 - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
-                    # --- HUMAN TRACKING & RE-ID ---
-                    person_crops = []
-                    crop_map = []
-                    for i, det in enumerate(person_high):
-                        x1, y1, x2, y2 = [int(v) for v in det.bbox]
-                        crop = frame[max(0, y1):min(fh, y2), max(0, x1):min(fw, x2)]
-                        if crop.size > 0:
-                            person_crops.append(crop)
-                            crop_map.append((i, crop))
-
-                    embeddings = {}
-                    if person_crops:
-                        embs = self.encoder.batch_extract(person_crops)
-                        if embs is not None:
-                            for j, (orig_idx, _) in enumerate(crop_map):
-                                embeddings[orig_idx] = embs[j]
-
-                    tracker = self.trackers[cam_id]
-                    events = tracker.update(person_high, person_low, embeddings, loop_ts)
-
-                    for ev in events:
-                        if ev.type == "TRACK_ACTIVATED" and ev.embedding is not None:
-                            match = self.global_matcher.match_phase1(ev.embedding, cam_id, loop_ts)
-                            tracker.set_global_id(ev.track_id, match.global_id, match.display_name)
-
-                            for _, crop in crop_map:
-                                threat = self.face_auth.verify_face(crop, match.global_id)
-                                if threat:
-                                    telemetry["alerts"].append({"type": "FACE_MATCH", "threat": threat, "camera": cam_id})
-
-                    # --- BEHAVIOR RISK ---
-                    risk_analyzer = self.risk_analyzers[cam_id]
-                    active_tracks = tracker.get_active_tracks()
-                    risk_inputs = [{"id": t.track_id, "bbox": [float(v) for v in t.bbox]} for t in active_tracks]
-                    risk_result = risk_analyzer.update(frame_idx=self._frame_count, tracks=risk_inputs)
-
-                    for item in risk_result["tracks"]:
-                        tid = item["id"]
-                        gid = tracker.local_to_global.get(tid, tid)
-                        x1, y1, x2, y2 = [int(v) for v in item["bbox"]]
-                        risk_score = item["confidence"] * 100
-
-                        color = (0, 255, 0)
-                        if item["label"] == "INTRUSION":
-                            color = (0, 0, 255)
-                        elif risk_score > 70:
-                            color = (0, 165, 255)
-
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                        label = f"G{gid} | R:{risk_score:.0f} | {item['label']}"
-                        cv2.putText(annotated, label, (x1, y1 - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                    fence_coords = risk_analyzer.virtual_fence_coords
-                    cv2.line(annotated,
-                             (int(fence_coords[0][0]), int(fence_coords[0][1])),
-                             (int(fence_coords[1][0]), int(fence_coords[1][1])),
-                             (255, 0, 255), 2)
-
-                    # Push annotated frame to API buffer
-                    self._shared_state.push_annotated_frame(cam_id, annotated)
-
-                    telemetry["streams"][cam_id] = risk_result
-
-                # Logging & Broadcast
-                self._log_telemetry(telemetry)
-                if self.telemetry_callback:
-                    self.telemetry_callback(telemetry)
-
+            super().run()
         except Exception as e:
             print(f"\n[CRITICAL] Orchestrator error: {e}")
             import traceback
             traceback.print_exc()
-        finally:
-            self.stream_manager.stop_all()
+
+
+# ═══════════════════════════════════════════════════════════
+#  DISPLAY COMPOSITOR (smooth live video, decoupled from analysis)
+# ═══════════════════════════════════════════════════════════
+
+def display_worker(shared_state: ShieldState):
+    """Publishes dashboard video at the camera's own rate (up to stream.display_fps).
+
+    Each output frame is the camera's NEWEST frame with the most recent analysis
+    overlay (boxes, labels, fence) copied on top. The analysis loop therefore never
+    limits how smooth the video looks; boxes refresh at the analysis rate.
+    """
+    stream_cfg = shared_state.config.get("stream", {})
+    period = 1.0 / max(1.0, float(stream_cfg.get("display_fps", 15)))
+    max_dim = int(stream_cfg.get("display_max_dim", 1280))
+    quality = int(stream_cfg.get("jpeg_quality", 70))
+    overlay_max_age = float(stream_cfg.get("overlay_max_age_sec", 1.5))
+    last_seq: Dict[str, int] = {}
+    masks: Dict[str, Tuple[float, np.ndarray, np.ndarray]] = {}  # cam -> (overlay ts, mask, annotated)
+
+    while shared_state.running:
+        tick = time.time()
+        orch = shared_state.orchestrator
+        if orch is None:
+            time.sleep(0.1)
+            continue
+        for cam_id, stream in list(orch.stream_manager.streams.items()):
+            try:
+                latest = stream.latest_display()
+                if latest is None or latest[2] == last_seq.get(cam_id):
+                    continue
+                frame, _, seq = latest
+                last_seq[cam_id] = seq
+
+                ov = shared_state.get_overlay(cam_id)
+                out = frame
+                if ov is not None and tick - ov[2] <= overlay_max_age:
+                    raw, ann, ov_ts = ov
+                    cached = masks.get(cam_id)
+                    if cached is None or cached[0] != ov_ts:
+                        if raw.shape == ann.shape:
+                            mask = np.any(cv2.absdiff(raw, ann), axis=2)
+                            masks[cam_id] = cached = (ov_ts, mask, ann)
+                        else:
+                            cached = None
+                    if cached is not None and cached[2].shape == frame.shape:
+                        out = frame.copy()
+                        out[cached[1]] = cached[2][cached[1]]
+
+                h, w = out.shape[:2]
+                if max(h, w) > max_dim:
+                    scale = max_dim / max(h, w)
+                    out = cv2.resize(out, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                ok, jpeg = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                if ok:
+                    now = time.time()
+                    with shared_state._frame_lock:
+                        shared_state._frame_buffer[cam_id] = (jpeg.tobytes(), now)
+                    q = shared_state.display_times.setdefault(cam_id, deque())
+                    q.append(now)
+                    while q and now - q[0] > 3.0:
+                        q.popleft()
+            except Exception as e:  # never let one bad frame stop the video
+                print(f"  [DISPLAY] {cam_id}: {e}")
+        time.sleep(max(0.0, period - (time.time() - tick)))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -461,6 +429,7 @@ async def lifespan(app: FastAPI):
     # Start ML pipeline in background thread
     state.ml_thread = threading.Thread(target=ml_worker, args=(state,), daemon=True)
     state.ml_thread.start()
+    threading.Thread(target=display_worker, args=(state,), name="display", daemon=True).start()
 
     # Start async telemetry bridge tasks
     bridge_task = asyncio.create_task(telemetry_bridge(state))
@@ -505,9 +474,15 @@ app.add_middleware(
 # ═══════════════════════════════════════════════════════════
 
 class FenceConfig(BaseModel):
-    """Virtual fence coordinates: two points defining a tripwire line."""
-    points: List[List[float]]  # [[x1, y1], [x2, y2]]
+    """Virtual fence drawn in the dashboard.
+
+    type "line": tripwire polyline, >= 2 points (crossing = intrusion)
+    type "zone": restricted area polygon, >= 3 points (inside = intrusion)
+    An empty points list disables the fence.
+    """
+    points: List[List[float]]  # [[x1, y1], [x2, y2], ...] in frame pixels
     camera_id: Optional[str] = None  # If None, apply to all cameras
+    type: str = "line"
 
 class PersonRegistration(BaseModel):
     """Register a known person with their name and face image."""
@@ -517,6 +492,43 @@ class PersonRegistration(BaseModel):
 class CameraControl(BaseModel):
     """Control a camera stream."""
     action: str  # "start" or "stop"
+
+class FaceEnrollment(BaseModel):
+    """Enrol a person into the facial-recognition watchlist."""
+    name: str
+    image: Optional[str] = None            # base64 JPEG/PNG (data: URLs accepted)
+    images: Optional[List[str]] = None     # several reference photos of the same person
+    category: str = "SUSPECT"              # SUSPECT | WANTED | BLACKLISTED | MISSING | VIP | AUTHORIZED …
+    notes: str = ""
+    identity_id: Optional[str] = None      # add references to an existing identity
+
+class ImageQuery(BaseModel):
+    image: str                             # base64 JPEG/PNG
+
+class PlateWatchEntry(BaseModel):
+    plate: str
+    tag: str = "BLACKLISTED"               # BLACKLISTED | STOLEN | WANTED | RESTRICTED | VIP …
+    notes: str = ""
+
+
+def decode_image(data: str) -> np.ndarray:
+    """Decode a base64 (optionally data-URL) image into a BGR array, or raise HTTP 400."""
+    try:
+        if "," in data[:100] and data.lstrip().startswith("data:"):
+            data = data.split(",", 1)[1]
+        np_arr = np.frombuffer(base64.b64decode(data), dtype=np.uint8)
+        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError("not a decodable image")
+        return image
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image data: {e}")
+
+
+def _require_pipeline():
+    if not state.orchestrator:
+        raise HTTPException(status_code=503, detail="ML pipeline not running")
+    return state.orchestrator
 
 
 # ═══════════════════════════════════════════════════════════
@@ -529,7 +541,9 @@ class CameraControl(BaseModel):
 async def get_system_status():
     """System health: uptime, FPS, active camera count, total tracks, gallery size."""
     uptime = time.time() - state.start_time if state.start_time > 0 else 0
-    fps = state.frame_count / max(1.0, uptime)
+    perf = state.orchestrator.performance() if state.orchestrator else {
+        "processing_fps": 0.0, "latency_ms": None, "cameras": {}}
+    fps = perf["processing_fps"]
 
     total_tracks = 0
     if state.orchestrator:
@@ -551,14 +565,32 @@ async def get_system_status():
         "telemetry_mode": "live",
         "server_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "uptime_seconds": round(uptime, 2),
-        "fps": round(fps, 2),
+        "fps": fps,                               # analysis loops per second (last 3 s)
+        "processing_fps": fps,
+        "latency_ms": perf["latency_ms"],         # capture -> analysis finished
+        "cameras_perf": {
+            cid: {**p, "display_fps": state.display_fps(cid)} for cid, p in perf["cameras"].items()
+        },
         "frame_count": state.frame_count,
         "active_cameras": active_cams,
         "total_cameras": len(state.camera_configs),
         "active_tracks": total_tracks,
         "gallery_size": gallery_size,
         "alert_buffer_size": len(state.recent_alerts),
+        "analytics": _analytics_status(),
     }
+
+
+def _analytics_status() -> dict:
+    orch = state.orchestrator
+    if not orch:
+        return {}
+    out = {"face_recognition": orch.face_auth.get_stats()}
+    out["anpr"] = orch.anpr_engine.get_stats() if orch.anpr_engine is not None else {"available": False}
+    out["night_mode"] = {cid: orch.stream_manager.is_night(cid) for cid in orch.stream_manager.streams}
+    out["alert_counts"] = dict(orch.alert_manager.counts)
+    out["webhook"] = {"enabled": bool(orch.alert_manager.webhook_url), **orch.alert_manager.webhook_stats}
+    return out
 
 
 # --- Camera Streams ---
@@ -583,7 +615,11 @@ async def get_active_streams():
             cam_info["status"] = "active" if stream.is_alive_stream else "stopped"
             w, h = stream.frame_size
             cam_info["resolution"] = {"width": w, "height": h} if w > 0 else None
-            cam_info["fps"] = round(stream.fps, 1)
+            cam_info["fps"] = round(stream.fps, 1)               # camera's own frame rate
+            cam_perf = state.orchestrator.performance()["cameras"].get(cam_cfg.camera_id, {})
+            cam_info["analysis_fps"] = cam_perf.get("analysis_fps", 0.0)
+            cam_info["display_fps"] = state.display_fps(cam_cfg.camera_id)
+            cam_info["latency_ms"] = cam_perf.get("latency_ms")
 
         cameras.append(cam_info)
 
@@ -624,15 +660,8 @@ async def control_camera_stream(camera_id: str, control: CameraControl):
         stream.stop()
         return {"status": "success", "message": f"Camera {camera_id} stopped"}
     elif control.action == "start":
-        if not stream.is_running:
-            # Re-create and start the stream
-            config = sm.configs.get(camera_id)
-            if config:
-                from core.stream_manager import CameraStream
-                new_stream = CameraStream(config)
-                sm.streams[camera_id] = new_stream
-                new_stream.start()
-                return {"status": "success", "message": f"Camera {camera_id} restarted"}
+        if sm.restart_camera(camera_id):
+            return {"status": "success", "message": f"Camera {camera_id} restarted"}
         return {"status": "success", "message": f"Camera {camera_id} already running"}
     else:
         raise HTTPException(status_code=400, detail=f"Invalid action: {control.action}. Use 'start' or 'stop'.")
@@ -727,15 +756,7 @@ async def register_person(registration: PersonRegistration):
     if not state.orchestrator:
         raise HTTPException(status_code=503, detail="ML pipeline not running")
 
-    # Decode base64 image
-    try:
-        image_bytes = base64.b64decode(registration.image)
-        np_arr = np.frombuffer(image_bytes, dtype=np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError("Failed to decode image")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image data: {e}")
+    image = decode_image(registration.image)
 
     # Extract embedding
     embedding = state.orchestrator.encoder.extract(image)
@@ -808,6 +829,126 @@ async def get_risk_summary():
     }
 
 
+# --- Facial Recognition (FRS) ---
+
+@app.post("/api/v1/faces/enroll")
+async def enroll_face(enrollment: FaceEnrollment):
+    """
+    Enrol a suspect (or authorised person) from one or more reference photos.
+    The largest face in each photo is embedded and stored in the persistent gallery.
+    Live tracks are then matched against it; threats raise FACE_MATCH_SUSPECT alerts.
+    """
+    orch = _require_pipeline()
+    raw = list(enrollment.images or []) + ([enrollment.image] if enrollment.image else [])
+    if not raw:
+        raise HTTPException(status_code=400, detail="Provide 'image' or 'images'")
+    images = [decode_image(r) for r in raw]
+    try:
+        result = await asyncio.to_thread(
+            orch.face_auth.enroll_face, enrollment.name, images, enrollment.category,
+            enrollment.notes, enrollment.identity_id)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {"status": "success", "message": f"Enrolled '{enrollment.name}'", "identity": result}
+
+
+@app.get("/api/v1/faces/gallery")
+async def get_face_gallery():
+    """List every enrolled identity (with thumbnail) in the FRS gallery."""
+    orch = _require_pipeline()
+    items = orch.face_auth.list_identities()
+    return {"status": "success", "identities": items, "total": len(items),
+            "engine": orch.face_auth.get_stats()}
+
+
+@app.delete("/api/v1/faces/{identity_id}")
+async def delete_face_identity(identity_id: str):
+    orch = _require_pipeline()
+    if not orch.face_auth.remove_identity(identity_id):
+        raise HTTPException(status_code=404, detail=f"Identity {identity_id} not found")
+    return {"status": "success", "message": f"Identity {identity_id} removed"}
+
+
+@app.post("/api/v1/faces/search")
+async def search_faces(query: ImageQuery):
+    """Detect all faces in an uploaded image and match each against the gallery."""
+    orch = _require_pipeline()
+    if not orch.face_auth.available:
+        raise HTTPException(status_code=503, detail="Face recognition models not loaded")
+    image = decode_image(query.image)
+    faces = await asyncio.to_thread(orch.face_auth.identify, image)
+    return {"status": "success", "faces": faces, "total": len(faces)}
+
+
+# --- ANPR ---
+
+def _require_anpr():
+    orch = _require_pipeline()
+    if orch.anpr_engine is None:
+        raise HTTPException(status_code=503, detail="ANPR is disabled in config.yaml")
+    return orch.anpr_engine
+
+
+@app.get("/api/v1/anpr/watchlist")
+async def get_plate_watchlist():
+    engine = _require_anpr()
+    items = engine.list_watchlist()
+    return {"status": "success", "watchlist": items, "total": len(items)}
+
+
+@app.post("/api/v1/anpr/watchlist")
+async def add_plate_watchlist(entry: PlateWatchEntry):
+    engine = _require_anpr()
+    from core.anpr import normalize_plate
+    plate = normalize_plate(entry.plate)
+    if len(plate) < 4:
+        raise HTTPException(status_code=400, detail="Plate must have at least 4 alphanumeric characters")
+    engine.update_watchlist({plate: {"tag": entry.tag, "notes": entry.notes}})
+    return {"status": "success", "message": f"{plate} added as {entry.tag.upper()}", "plate": plate}
+
+
+@app.delete("/api/v1/anpr/watchlist/{plate}")
+async def remove_plate_watchlist(plate: str):
+    engine = _require_anpr()
+    if not engine.remove_from_watchlist(plate):
+        raise HTTPException(status_code=404, detail=f"{plate} is not on the watchlist")
+    return {"status": "success", "message": f"{plate} removed"}
+
+
+@app.get("/api/v1/anpr/plates")
+async def get_recent_plates(limit: int = Query(default=50, ge=1, le=500)):
+    """Recently confirmed plates (temporal-voting consensus), newest first."""
+    engine = _require_anpr()
+    plates = [p.to_dict() for p in reversed(list(engine.recent_plates))][:limit]
+    return {"status": "success", "plates": plates, "total": len(engine.recent_plates)}
+
+
+@app.post("/api/v1/anpr/recognize")
+async def recognize_plate(query: ImageQuery):
+    """One-shot plate recognition on an uploaded vehicle/plate image."""
+    engine = _require_anpr()
+    if not engine.available:
+        raise HTTPException(status_code=503, detail="OCR engine not available (pip install easyocr)")
+    image = decode_image(query.image)
+    result = await asyncio.to_thread(engine.recognize_image, image)
+    return {"status": "success", "result": result}
+
+
+# --- Event log (C&C integration) ---
+
+@app.get("/api/v1/events")
+async def get_event_log(
+    limit: int = Query(default=100, ge=1, le=5000),
+    alert_type: Optional[str] = Query(default=None),
+):
+    """Persistent alert/event log (logs/events.jsonl), newest first — survives restarts."""
+    orch = _require_pipeline()
+    events = await asyncio.to_thread(orch.alert_manager.read_events, limit, alert_type)
+    return {"status": "success", "events": events, "total": len(events)}
+
+
 # --- Virtual Fence ---
 
 @app.post("/api/v1/fence/config")
@@ -816,23 +957,66 @@ async def update_virtual_fence(fence: FenceConfig):
     if not state.orchestrator:
         raise HTTPException(status_code=503, detail="ML pipeline not running")
 
-    if len(fence.points) != 2 or any(len(p) != 2 for p in fence.points):
-        raise HTTPException(status_code=400, detail="Fence must be exactly 2 points: [[x1,y1], [x2,y2]]")
+    if fence.type not in ("line", "zone"):
+        raise HTTPException(status_code=400, detail="type must be 'line' (tripwire) or 'zone' (area)")
+    if any(len(p) != 2 for p in fence.points):
+        raise HTTPException(status_code=400, detail="Each point must be [x, y]")
+    minimum = 3 if fence.type == "zone" else 2
+    if fence.points and len(fence.points) < minimum:
+        raise HTTPException(status_code=400,
+                            detail=f"A {fence.type} needs at least {minimum} points (or none to disable)")
 
-    new_coords = [(fence.points[0][0], fence.points[0][1]),
-                  (fence.points[1][0], fence.points[1][1])]
+    new_coords = [(float(p[0]), float(p[1])) for p in fence.points]
+    analyzers = state.orchestrator.risk_analyzers
+    if fence.camera_id and fence.camera_id not in analyzers:
+        raise HTTPException(status_code=404, detail=f"Camera {fence.camera_id} not found")
+    targets = [fence.camera_id] if fence.camera_id else list(analyzers)
+    for cam_id in targets:
+        if analyzers[cam_id].update_fence(new_coords, fence.type) is False:
+            raise HTTPException(status_code=400, detail="Shape has no area; spread the points out")
+    try:
+        state.orchestrator.save_fences()
+    except Exception as e:  # saving is best-effort; the live fence is already applied
+        print(f"  [FENCE] could not save fences: {e}")
+    where = fence.camera_id or "all cameras"
+    return {"status": "success", "message": f"Fence updated for {where}"}
 
-    if fence.camera_id:
-        # Update specific camera
-        if fence.camera_id not in state.orchestrator.risk_analyzers:
-            raise HTTPException(status_code=404, detail=f"Camera {fence.camera_id} not found")
-        state.orchestrator.risk_analyzers[fence.camera_id].update_fence(new_coords)
-        return {"status": "success", "message": f"Fence updated for {fence.camera_id}"}
-    else:
-        # Update all cameras
-        for analyzer in state.orchestrator.risk_analyzers.values():
-            analyzer.update_fence(new_coords)
-        return {"status": "success", "message": "Fence updated for all cameras"}
+
+class IgnoreZones(BaseModel):
+    """Areas whose detections are ignored (posters, screens, mirrors). [] removes all."""
+    camera_id: str
+    zones: List[List[List[float]]]   # [[[x, y], [x, y], [x, y], ...], ...]
+
+
+@app.post("/api/v1/fence/ignore")
+async def update_ignore_zones(cfg: IgnoreZones):
+    if not state.orchestrator:
+        raise HTTPException(status_code=503, detail="ML pipeline not running")
+    if cfg.camera_id not in state.orchestrator.risk_analyzers:
+        raise HTTPException(status_code=404, detail=f"Camera {cfg.camera_id} not found")
+    if any(len(z) < 3 or any(len(p) != 2 for p in z) for z in cfg.zones):
+        raise HTTPException(status_code=400, detail="Each ignore area needs at least 3 [x, y] points")
+    kept = state.orchestrator.set_ignore_zones(cfg.camera_id, cfg.zones)
+    if kept != len(cfg.zones):
+        raise HTTPException(status_code=400, detail="An ignore area has no area; spread its points out")
+    try:
+        state.orchestrator.save_fences()
+    except Exception as e:
+        print(f"  [FENCE] could not save ignore areas: {e}")
+    return {"status": "success", "message": f"{kept} ignore area(s) set for {cfg.camera_id}"}
+
+
+@app.get("/api/v1/fence/{camera_id}")
+async def get_virtual_fence(camera_id: str):
+    """Current fence of a camera (for the dashboard editor)."""
+    if not state.orchestrator:
+        raise HTTPException(status_code=503, detail="ML pipeline not running")
+    analyzer = state.orchestrator.risk_analyzers.get(camera_id)
+    if analyzer is None:
+        raise HTTPException(status_code=404, detail=f"Camera {camera_id} not found")
+    ignore = getattr(state.orchestrator, "ignore_zones", {}).get(camera_id, {}).get("points", [])
+    return {"status": "success", "camera_id": camera_id, **analyzer.fence_dict(),
+            "ignore": ignore if isinstance(ignore, list) else []}
 
 
 # ═══════════════════════════════════════════════════════════

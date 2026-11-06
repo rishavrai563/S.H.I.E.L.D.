@@ -176,3 +176,7 @@ yarn-debug.log*
 yarn-error.log*
 Backend/static/*
 !Backend/static/.gitkeep
+
+# Runtime watchlists & face gallery (biometric data — never commit)
+Backend/data/*
+!Backend/data/.gitkeep
