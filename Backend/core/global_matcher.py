@@ -57,6 +57,7 @@ class MatchResult:
     is_new: bool                            # True if new GlobalID was created
     phase: int                              # 1 or 2
     is_registered: bool = False
+    previous_camera: Optional[str] = None   # where this identity was last seen before
 
 
 class GlobalMatcher:
@@ -114,7 +115,8 @@ class GlobalMatcher:
     # ═══════════════════════════════════════════════════════
 
     def match_phase1(self, embedding: np.ndarray,
-                     camera_id: str, timestamp: float) -> MatchResult:
+                     camera_id: str, timestamp: float,
+                     exclude_gids: Optional[set] = None) -> MatchResult:
         """
         Phase 1 — Early Match. Called when track becomes Active.
         Uses single best embedding for fast GlobalID assignment.
@@ -126,13 +128,13 @@ class GlobalMatcher:
 
         with self._lock:
             # Step 1: Check registered persons first
-            reg_result = self._match_registered(embedding, camera_id, timestamp)
+            reg_result = self._match_registered(embedding, camera_id, timestamp, exclude_gids)
             if reg_result is not None:
                 return reg_result
 
-            # Step 2: Check existing gallery
+            # Step 2: Check existing gallery (never an ID already on screen in this camera)
             gallery_result = self._match_gallery(
-                embedding, camera_id, timestamp, phase=1
+                embedding, camera_id, timestamp, phase=1, exclude=exclude_gids
             )
             if gallery_result is not None:
                 return gallery_result
@@ -262,6 +264,48 @@ class GlobalMatcher:
             self._gallery_dirty = True
             return gid
 
+    def rematch(self, embedding: np.ndarray, camera_id: str, timestamp: float,
+                exclude_gids: set, threshold: Optional[float] = None,
+                margin: Optional[float] = None) -> Optional[MatchResult]:
+        """Late correction for a track that got a NEW id at activation (e.g. it entered
+        half-visible). With a better pooled embedding, look for an existing identity.
+        Returns the match, or None to keep the provisional id."""
+        if embedding is None:
+            return None
+        with self._lock:
+            res = self._match_registered(embedding, camera_id, timestamp, exclude_gids)
+            if res is None:
+                res = self._match_gallery(embedding, camera_id, timestamp, phase=1, exclude=exclude_gids,
+                                          threshold=threshold, margin=margin)
+            return res
+
+    def remove_identity(self, global_id: int) -> None:
+        """Drop a provisional (never-confirmed) identity after it was merged."""
+        with self._lock:
+            ident = self._identities.get(global_id)
+            if ident is not None and not ident.is_registered:
+                del self._identities[global_id]
+                self._gallery_dirty = True
+
+    def record_visit(self, global_id: int, camera_id: str, timestamp: float) -> None:
+        """Person (re)identified on a camera: extend the current visit or start a new one
+        in the journey (camera_history = [(camera, entered, last_seen), ...])."""
+        ident = self._identities.get(global_id)
+        if ident is None:
+            return
+        hist = ident.camera_history
+        if hist and hist[-1][0] == camera_id:
+            hist[-1] = (camera_id, hist[-1][1], timestamp)
+        else:
+            hist.append((camera_id, timestamp, timestamp))
+        ident.last_seen_time = timestamp
+        ident.last_seen_camera = camera_id
+
+    def mark_seen(self, global_id: int, camera_id: str, timestamp: float) -> None:
+        """Record that an identity is visible right now (keeps the camera-transit
+        time check measuring from when the person LEFT, not when they appeared)."""
+        self.record_visit(global_id, camera_id, timestamp)
+
     def get_identity(self, global_id: int) -> Optional[GlobalIdentity]:
         """Get a GlobalIdentity by ID."""
         return self._identities.get(global_id)
@@ -310,7 +354,8 @@ class GlobalMatcher:
     # ═══════════════════════════════════════════════════════
 
     def _match_registered(self, embedding: np.ndarray,
-                          camera_id: str, timestamp: float
+                          camera_id: str, timestamp: float,
+                          exclude: Optional[set] = None
                           ) -> Optional[MatchResult]:
         """
         Check registered persons first (priority over gallery).
@@ -323,7 +368,7 @@ class GlobalMatcher:
         best_sim = self.registered_thr
 
         for gid, identity in self._registered.items():
-            if identity.prototype is None:
+            if identity.prototype is None or (exclude and gid in exclude):
                 continue
             sim = float(np.dot(embedding, identity.prototype))
             if sim > best_sim:
@@ -333,6 +378,7 @@ class GlobalMatcher:
 
         if best_gid is not None:
             identity = self._identities[best_gid]
+            prev_cam = identity.last_seen_camera
             identity.last_seen_time = timestamp
             identity.last_seen_camera = camera_id
             identity.times_seen += 1
@@ -343,6 +389,7 @@ class GlobalMatcher:
                 is_new=False,
                 phase=1,
                 is_registered=True,
+                previous_camera=prev_cam,
             )
 
         return None
@@ -350,7 +397,10 @@ class GlobalMatcher:
     def _match_gallery(self, embedding: np.ndarray,
                        camera_id: str, timestamp: float,
                        phase: int,
-                       exclude_gid: Optional[int] = None) -> Optional[MatchResult]:
+                       exclude_gid: Optional[int] = None,
+                       exclude: Optional[set] = None,
+                       threshold: Optional[float] = None,
+                       margin: Optional[float] = None) -> Optional[MatchResult]:
         """
         Vectorized gallery matching with margin gate.
 
@@ -374,10 +424,15 @@ class GlobalMatcher:
         # Vectorized cosine similarity: gallery_matrix @ query → (N,) scores
         similarities = self._gallery_embeddings @ embedding  # (N,)
 
-        # If excluding a GID, mask it out
-        if exclude_gid is not None and exclude_gid in self._gallery_ids:
-            exclude_idx = self._gallery_ids.index(exclude_gid)
-            similarities[exclude_idx] = -1.0  # Force below any threshold
+        # Mask out excluded GIDs (forced below any threshold)
+        excluded = set(exclude or ())
+        if exclude_gid is not None:
+            excluded.add(exclude_gid)
+        for gid in excluded:
+            if gid in self._gallery_ids:
+                similarities[self._gallery_ids.index(gid)] = -1.0
+        if len(excluded) >= len(self._gallery_ids):
+            return None
 
         # Sort descending
         sorted_indices = np.argsort(-similarities)
@@ -389,15 +444,18 @@ class GlobalMatcher:
         # Margin gate: ensure the match is unambiguous
         if len(sorted_indices) > 1:
             top2_score = float(similarities[sorted_indices[1]])
-            margin = top1_score - top2_score
+            margin_val = top1_score - top2_score
         else:
-            margin = 1.0  # Only one entry — no ambiguity
+            margin_val = 1.0  # Only one entry — no ambiguity
 
-        if top1_score >= self.gallery_thr and margin >= self.margin_gate:
+        thr = self.gallery_thr if threshold is None else threshold
+        gate = self.margin_gate if margin is None else margin
+        if top1_score >= thr and margin_val >= gate:
             identity = self._identities[top1_gid]
 
             # Time plausibility check
             if self._time_plausible(identity, camera_id, timestamp):
+                prev_cam = identity.last_seen_camera
                 identity.last_seen_time = timestamp
                 identity.last_seen_camera = camera_id
                 identity.times_seen += 1
@@ -408,6 +466,7 @@ class GlobalMatcher:
                     is_new=False,
                     phase=phase,
                     is_registered=identity.is_registered,
+                    previous_camera=prev_cam,
                 )
 
         return None

@@ -201,3 +201,53 @@ class TestMarginGating:
         result = gm.match_phase1(query, "cam2", 10.0)
         # Should create new ID due to ambiguity (or match the closest if margin is met)
         assert isinstance(result, MatchResult)
+
+
+class TestCrossCameraLifecycle:
+    def _gm(self, **kw):
+        return GlobalMatcher(diff_camera_default_min=kw.pop("gap", 2.0), **kw)
+
+    def test_excluded_ids_are_never_returned(self):
+        gm = self._gm()
+        a = _make_emb(1)
+        g1 = gm.match_phase1(a, "cam1", 0.0).global_id
+        res = gm.match_phase1(_similar_emb(a), "cam1", 5.0, exclude_gids={g1})
+        assert res.is_new and res.global_id != g1
+
+    def test_mark_seen_blocks_impossible_transit(self):
+        gm = self._gm(gap=2.0)
+        a = _make_emb(2)
+        g = gm.match_phase1(a, "cam1", 0.0).global_id
+        gm.mark_seen(g, "cam1", 10.0)                    # still visible on cam1 at t=10
+        res = gm.match_phase1(_similar_emb(a), "cam2", 10.5)
+        assert res.is_new                                 # 0.5 s later on cam2: implausible
+        res2 = gm.rematch(_similar_emb(a), "cam2", 13.0, exclude_gids={res.global_id})  # own provisional id
+        assert res2 is not None and res2.global_id == g   # after the transit gap: same person
+
+    def test_rematch_respects_stricter_threshold(self):
+        gm = self._gm()
+        a = _make_emb(3)
+        g = gm.match_phase1(a, "cam1", 0.0).global_id
+        weak = _similar_emb(a, noise_scale=0.06, seed=7)
+        sim = float(np.dot(weak, gm.get_identity(g).prototype))
+        assert gm.rematch(weak, "cam2", 10.0, set(), threshold=sim + 0.01) is None
+        assert gm.rematch(weak, "cam2", 10.0, set(), threshold=sim - 0.01).global_id == g
+
+    def test_remove_identity_drops_provisional_only(self):
+        gm = self._gm()
+        g = gm.match_phase1(_make_emb(4), "cam1", 0.0).global_id
+        reg = gm.register_person("VIP", _make_emb(5))
+        gm.remove_identity(g); gm.remove_identity(reg)
+        assert gm.get_identity(g) is None and gm.get_identity(reg) is not None
+
+
+def test_record_visit_builds_journey():
+    gm = GlobalMatcher()
+    g = gm.match_phase1(_make_emb(11), "cam1", 0.0).global_id
+    for t in (1.0, 2.0):
+        gm.mark_seen(g, "cam1", t)
+    gm.record_visit(g, "cam2", 3.5)
+    gm.mark_seen(g, "cam2", 5.0)
+    j = gm.get_journey(g)
+    assert [c for c, _, _ in j] == ["cam1", "cam2"]
+    assert j[0][2] == 2.0 and j[1][1:] == (3.5, 5.0)

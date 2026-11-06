@@ -182,7 +182,9 @@ class RiskAnalyzer:
     """
 
     PRIORITY = {
-        "INTRUSION": 6,           # NEW: Virtual Fence breach (Highest Priority)
+        "INTRUSION": 8,           # Tripwire crossed (highest priority)
+        "RESTRICTED_ZONE": 7,     # Inside a restricted zone right now (suspicious until they leave)
+        "LOITERING": 6,           # Near-stationary dwell beyond loiter_seconds
         "SUSPICIOUS_MOTION": 5,
         "INTERACTION": 4,
         "NEW_ENTRY": 3,
@@ -210,6 +212,8 @@ class RiskAnalyzer:
         interaction_distance_px: float = 120.0,
         interaction_hold_frames: int = 12,
         suspicious_min_frames: int = 8,
+        loiter_seconds: float = 30.0,
+        loiter_displacement_px: float = 30.0,
     ):
         from shapely.geometry import LineString # Imported here for strict math
 
@@ -236,6 +240,12 @@ class RiskAnalyzer:
             hold_frames=interaction_hold_frames,
         )
 
+        self.loiter_seconds = float(loiter_seconds)
+        self.loiter_displacement_px = float(loiter_displacement_px)
+        # track id -> (anchor_x, anchor_y, anchor_time) for dwell measurement
+        self._loiter_anchor: Dict[int, Tuple[float, float, float]] = {}
+        self._prev_bottom: Dict[int, Tuple[float, float]] = {}
+
         self._isolation_counter: Dict[int, int] = defaultdict(int)
         self._density_counter = 0
         self._high_density_active = False
@@ -246,15 +256,64 @@ class RiskAnalyzer:
         # Formatted as [(x1, y1), (x2, y2)]
         self.virtual_fence_coords = [(50, self.frame_height - 50), (self.frame_width - 50, self.frame_height - 50)]
         self.virtual_fence_line = LineString(self.virtual_fence_coords)
+        # "line" = tripwire (open polyline, any number of segments): crossing it = intrusion
+        # "zone" = restricted area (closed polygon, any shape): standing inside it = intrusion
+        self.fence_type = "line"
+        self.fence_zone = None            # shapely Polygon when fence_type == "zone"
         self.intruders = set() # Store track IDs that breached the fence
+        self.zone_occupants: Set[int] = set()        # track IDs inside the restricted zone now
+        self._zone_entered_at: Dict[int, float] = {}
 
-    def update_fence(self, new_coords: List[Tuple[float, float]]):
-        """Dynamically update the tripwire coordinates from the C&C Dashboard."""
+    # -- geometry helpers, shared with vehicle tracking in the orchestrator --
+    def crossed_tripwire(self, prev_pt, curr_pt) -> bool:
+        """True if the movement prev_pt -> curr_pt crosses the tripwire."""
         from shapely.geometry import LineString
-        if len(new_coords) == 2:
-            self.virtual_fence_coords = new_coords
-            self.virtual_fence_line = LineString(self.virtual_fence_coords)
-            print(f"🚧 Virtual Fence mathematically recalibrated to: {new_coords}")
+        if self.virtual_fence_line is None or prev_pt is None or prev_pt == curr_pt:
+            return False
+        return self.virtual_fence_line.intersects(LineString([prev_pt, curr_pt]))
+
+    def in_zone(self, pt) -> bool:
+        """True if the point is inside the restricted zone."""
+        from shapely.geometry import Point
+        return self.fence_zone is not None and self.fence_zone.contains(Point(pt))
+
+    def update_fence(self, new_coords: List[Tuple[float, float]], fence_type: str = "line") -> bool:
+        """Set the fence from the dashboard editor. An empty list disables it.
+
+        line: >= 2 points, crossing any segment flags INTRUSION (stays flagged).
+        zone: >= 3 points, a person whose feet are inside is flagged while inside.
+        """
+        from shapely.geometry import LineString, Polygon
+        coords = [(float(x), float(y)) for x, y in new_coords]
+        if not coords:
+            self.virtual_fence_coords, self.virtual_fence_line, self.fence_zone = [], None, None
+            self.fence_type = fence_type
+            self.intruders.clear(); self.zone_occupants.clear(); self._zone_entered_at.clear()
+            print("🚧 Virtual fence disabled")
+            return True
+        if fence_type == "zone":
+            if len(coords) < 3:
+                return False
+            poly = Polygon(coords)
+            if not poly.is_valid:            # self-intersecting drawing -> repair
+                poly = poly.buffer(0)
+            if poly.is_empty or poly.area <= 1.0:
+                return False
+            self.fence_zone, self.virtual_fence_line = poly, None
+        else:
+            if len(coords) < 2:
+                return False
+            fence_type = "line"
+            self.virtual_fence_line, self.fence_zone = LineString(coords), None
+        self.fence_type = fence_type
+        self.virtual_fence_coords = coords
+        self.intruders.clear(); self.zone_occupants.clear(); self._zone_entered_at.clear()
+        print(f"🚧 Virtual fence ({fence_type}, {len(coords)} points) updated")
+        return True
+
+    def fence_dict(self) -> dict:
+        return {"type": self.fence_type, "points": [[x, y] for x, y in self.virtual_fence_coords],
+                "frame": {"width": self.frame_width, "height": self.frame_height}}
 
     def _compute_scene_density(self, people_count: int) -> float:
         return float(people_count) / self.visible_area
@@ -294,10 +353,33 @@ class RiskAnalyzer:
             return "ACTIVE"
         return "CALM"
 
-    def update(self, frame_idx: int, tracks: List[Dict]) -> Dict:
-        from shapely.geometry import LineString
-        
+    def _update_loiter(self, tid: int, point: Tuple[float, float], now: float) -> float:
+        """Return seconds the track has stayed within loiter_displacement_px of its anchor."""
+        anchor = self._loiter_anchor.get(tid)
+        if anchor is None or ((point[0] - anchor[0]) ** 2 + (point[1] - anchor[1]) ** 2) ** 0.5 > self.loiter_displacement_px:
+            self._loiter_anchor[tid] = (point[0], point[1], now)
+            return 0.0
+        return now - anchor[2]
+
+    def update(self, frame_idx: int, tracks: List[Dict], timestamp: Optional[float] = None) -> Dict:
+        """
+        Args:
+            frame_idx: monotonically increasing frame counter.
+            tracks:    [{"id": int, "bbox": [x1, y1, x2, y2]}, ...]
+            timestamp: wall/stream time in seconds. Used for loitering dwell;
+                       falls back to frame_idx / fps when omitted.
+        """
+        from shapely.geometry import LineString, Point
+
+        now = float(timestamp) if timestamp is not None else frame_idx / self.fps
         states, exits = self.state_manager.update_tracks(frame_idx, tracks)
+        for tid in exits:
+            self.intruders.discard(tid)
+            self.zone_occupants.discard(tid)
+            self._zone_entered_at.pop(tid, None)
+            self._loiter_anchor.pop(tid, None)
+            self._prev_bottom.pop(tid, None)
+            self._isolation_counter.pop(tid, None)
         interactions = self.interaction_detector.update(tracks)
 
         # Scene density calculation
@@ -329,25 +411,28 @@ class RiskAnalyzer:
             speed_px_s = smooth_speed_px_per_frame * self.fps
             st.speed = speed_px_s
 
-            # --- NEW: Virtual Fence Intersection Math ---
-            # Create a movement vector from previous position to current position
-            if len(st.positions_history) >= 2:
-                # Use the bottom center of the bounding box for accurate ground-level crossing
-                x1, y1, x2, y2 = bbox
-                curr_bottom_center = ((x1 + x2) / 2, y2)
-                
-                # Get the previous bottom center based on history
-                prev_cx, prev_cy = st.positions_history[-2] 
-                # Estimate previous y2 based on current bbox height to maintain scale
-                prev_bottom_center = (prev_cx, prev_cy + ((y2 - y1) / 2)) 
+            # --- Virtual fence: foot-point movement vector vs tripwire ---
+            x1, y1, x2, y2 = bbox
+            curr_bottom_center = ((x1 + x2) / 2, y2)
+            prev_bottom_center = self._prev_bottom.get(tid)
+            # Restricted zone: flagged while the feet are inside, cleared the moment they leave
+            if self.in_zone(curr_bottom_center):
+                if tid not in self.zone_occupants:
+                    self.zone_occupants.add(tid)
+                    self._zone_entered_at[tid] = now
+            else:
+                self.zone_occupants.discard(tid)
+                self._zone_entered_at.pop(tid, None)
+            # Tripwire: crossing it flags the track (stays flagged while tracked)
+            if self.crossed_tripwire(prev_bottom_center, curr_bottom_center):
+                self.intruders.add(tid)
+            self._prev_bottom[tid] = curr_bottom_center
 
-                movement_vector = LineString([prev_bottom_center, curr_bottom_center])
-                
-                # Mathematical intersection verification
-                if self.virtual_fence_line.intersects(movement_vector):
-                    self.intruders.add(tid)
-            
             is_intruding = tid in self.intruders
+            in_zone = tid in self.zone_occupants
+            zone_dwell = now - self._zone_entered_at[tid] if in_zone else 0.0
+            dwell_sec = self._update_loiter(tid, curr_bottom_center, now)
+            is_loitering = dwell_sec >= self.loiter_seconds
 
             # Existing Anomaly Checks
             if not st.suspicious_active and speed_px_s >= self.suspicious_enter:
@@ -382,7 +467,9 @@ class RiskAnalyzer:
             
             # Prioritized Flags
             active_flags = {
-                "INTRUSION": is_intruding, # NEW
+                "INTRUSION": is_intruding,
+                "RESTRICTED_ZONE": in_zone,
+                "LOITERING": is_loitering,
                 "SUSPICIOUS_MOTION": st.suspicious_active,
                 "INTERACTION": len(interacting_ids) > 0,
                 "NEW_ENTRY": is_new_entry,
@@ -391,16 +478,27 @@ class RiskAnalyzer:
                 "NORMAL": True,
             }
             proposed = self._with_priority(active_flags)
-            final_label, duration = self.smoother.stable_label(st, proposed)
+            if proposed in ("INTRUSION", "RESTRICTED_ZONE") or (
+                    st.state_label == "RESTRICTED_ZONE" and not in_zone):
+                # Fence events are geometric facts: apply instantly, no label smoothing
+                if st.state_label != proposed:
+                    st.state_label, st.state_duration = proposed, 0
+                st.candidate_label, st.candidate_duration = proposed, 0
+                st.state_duration += 1
+                final_label, duration = proposed, st.state_duration
+            else:
+                final_label, duration = self.smoother.stable_label(st, proposed)
 
             if final_label == "INTRUSION":
                 intrusion_count += 1
-            if final_label == "SUSPICIOUS_MOTION":
+            if final_label in ("SUSPICIOUS_MOTION", "LOITERING", "RESTRICTED_ZONE"):
                 suspicious_count += 1
             if final_label == "INTERACTION":
                 interacting_count += 1
 
             conf = self._track_confidence(final_label, speed_px_s, len(interacting_ids), duration)
+            if final_label == "LOITERING":
+                conf = min(1.0, 0.75 + 0.25 * (dwell_sec - self.loiter_seconds) / max(1.0, self.loiter_seconds))
             
             # Hard gate for sustained motion
             if final_label == "SUSPICIOUS_MOTION":
@@ -419,6 +517,9 @@ class RiskAnalyzer:
                 "speed": round(speed_px_s, 2),
                 "interaction_with": interacting_ids,
                 "duration_in_state": int(duration),
+                "dwell_sec": round(dwell_sec, 1),
+                "in_zone": in_zone,
+                "zone_dwell_sec": round(zone_dwell, 1),
             })
 
         scene_status = self._scene_status(suspicious_count, interacting_count, len(tracks), intrusion_count)

@@ -204,3 +204,83 @@ class TestRiskAnalyzer:
         ra.update(frame_idx=0, tracks=[{"id": 1, "bbox": [100, 200, 180, 400]}])
         result = ra.update(frame_idx=1, tracks=[])  # Track 1 exits
         assert 1 in result["exits"]
+
+
+class TestLoiteringAndFence:
+    def test_loitering_after_dwell(self):
+        ra = RiskAnalyzer(frame_width=1920, frame_height=1080, fps=10.0, loiter_seconds=5.0,
+                          loiter_displacement_px=30.0, min_switch_frames=2)
+        labels = []
+        for i in range(80):  # 8 s standing still (small jitter)
+            jitter = (i % 3) * 2
+            res = ra.update(frame_idx=i, tracks=[{"id": 1, "bbox": [500 + jitter, 300, 560 + jitter, 450]}],
+                            timestamp=i * 0.1)
+            labels.append(res["tracks"][0]["label"])
+        assert "LOITERING" in labels[55:]
+        assert res["tracks"][0]["dwell_sec"] >= 5.0
+
+    def test_moving_person_never_loiters(self):
+        ra = RiskAnalyzer(frame_width=1920, frame_height=1080, fps=10.0, loiter_seconds=3.0, min_switch_frames=2)
+        for i in range(80):
+            res = ra.update(frame_idx=i, tracks=[{"id": 1, "bbox": [100 + i * 10, 300, 160 + i * 10, 450]}],
+                            timestamp=i * 0.1)
+            assert res["tracks"][0]["label"] != "LOITERING"
+
+    def test_fence_crossing_flags_intrusion_and_cleans_up(self):
+        ra = RiskAnalyzer(frame_width=1000, frame_height=1000, fps=10.0, min_switch_frames=1)
+        ra.update_fence([(0, 500), (1000, 500)])
+        for i, y2 in enumerate([450, 480, 520, 560, 600, 640, 680, 700]):
+            res = ra.update(frame_idx=i, tracks=[{"id": 7, "bbox": [400, y2 - 150, 460, y2]}], timestamp=i * 0.1)
+        assert 7 in ra.intruders
+        assert res["tracks"][0]["label"] == "INTRUSION"
+        assert res["scene_status"] == "BREACH_DETECTED"
+        ra.update(frame_idx=99, tracks=[], timestamp=9.9)   # track leaves
+        assert 7 not in ra.intruders
+
+
+class TestDrawnFences:
+    @staticmethod
+    def _walk(ra, xs, ys, tid=7):
+        res = None
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            res = ra.update(frame_idx=i, tracks=[{"id": tid, "bbox": [x - 30, y - 150, x + 30, y]}], timestamp=i * 0.1)
+        return res
+
+    def test_zone_flags_while_inside_and_clears_on_exit(self):
+        ra = RiskAnalyzer(frame_width=1000, frame_height=1000, fps=10.0, min_switch_frames=6)
+        assert ra.update_fence([(300, 300), (700, 300), (700, 700), (300, 700)], "zone")
+        res = self._walk(ra, [100, 200, 400], [500] * 3)              # steps into the square
+        assert 7 in ra.zone_occupants and 7 not in ra.intruders
+        assert res["tracks"][0]["label"] == "RESTRICTED_ZONE"         # instantly, despite smoothing
+        assert res["tracks"][0]["in_zone"] is True
+        res = self._walk(ra, [800], [500])                             # one step out
+        assert 7 not in ra.zone_occupants
+        assert res["tracks"][0]["label"] != "RESTRICTED_ZONE"         # cleared the moment they leave
+
+    def test_irregular_polygon_zone(self):
+        ra = RiskAnalyzer(frame_width=1000, frame_height=1000)
+        assert ra.update_fence([(100, 100), (900, 100), (500, 400), (900, 900), (100, 900)], "zone")  # notched
+        self._walk(ra, [800, 800], [400, 400])     # inside the notch = outside the zone
+        assert 7 not in ra.zone_occupants
+        self._walk(ra, [200, 200], [500, 500])
+        assert 7 in ra.zone_occupants
+
+    def test_tripwire_label_is_immediate(self):
+        ra = RiskAnalyzer(frame_width=1000, frame_height=1000, fps=10.0, min_switch_frames=6)
+        ra.update_fence([(0, 500), (1000, 500)], "line")
+        res = self._walk(ra, [500, 500], [450, 550])
+        assert res["tracks"][0]["label"] == "INTRUSION"
+
+    def test_multi_segment_tripwire(self):
+        ra = RiskAnalyzer(frame_width=1000, frame_height=1000)
+        assert ra.update_fence([(0, 600), (400, 600), (600, 300), (1000, 300)], "line")
+        self._walk(ra, [800, 800, 800], [200, 280, 360])   # crosses the 3rd segment
+        assert 7 in ra.intruders
+
+    def test_invalid_shapes_rejected_and_disable(self):
+        ra = RiskAnalyzer(frame_width=1000, frame_height=1000)
+        assert ra.update_fence([(0, 0), (10, 10)], "zone") is False
+        assert ra.update_fence([(0, 0), (100, 0), (200, 0)], "zone") is False   # no area
+        assert ra.update_fence([], "line") is True
+        self._walk(ra, [500, 500, 500], [100, 500, 900])
+        assert not ra.intruders and ra.fence_dict()["points"] == []
