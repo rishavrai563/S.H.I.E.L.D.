@@ -7,8 +7,9 @@ import WatchlistModal from './components/WatchlistModal'
 import ErrorBoundary from './components/ErrorBoundary'
 import PixelArrow from './components/PixelArrow'
 import Landing from './components/Landing'
+import About from './components/About'
 import type { SectorCamera } from './components/SectorMap'
-import { startSmoothScroll } from './lib/smoothScroll'
+import { scrollToTop, startSmoothScroll } from './lib/smoothScroll'
 import { useStreams } from './hooks/useStreams'
 import { useTelemetry } from './hooks/useTelemetry'
 import type { CameraStream, CameraTelemetry, ConnectionStatus, RiskLevel } from './types/telemetry'
@@ -38,7 +39,22 @@ function GridTags({ streams }: { streams: CameraStream[] }) {
   </div>
 }
 
+type View = 'console' | 'about'
+const viewFromHash = (): View => (window.location.hash.replace(/^#\/?/, '') === 'about' ? 'about' : 'console')
+
 export default function App() {
+  // Two sections: the live Console (default) and the About presentation; #/about and #/console
+  // keep the browser's back button and bookmarks working.
+  const [view, setView] = useState<View>(viewFromHash)
+  useEffect(() => {
+    const onHash = () => { setView(viewFromHash()); scrollToTop() }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+  const navigate = useCallback((v: View) => {
+    if (v === view) { scrollToTop(); return }
+    window.location.hash = `/${v}`
+  }, [view])
   const { status, cameras, alerts, latestFrame, lastMessageAt, stale, criticalFlash, clearAlerts } = useTelemetry()
   const { streams, serverStatus } = useStreams()
   const [fenceCamera, setFenceCamera] = useState('cam1')
@@ -73,10 +89,11 @@ export default function App() {
     : `${liveCameras} of ${streams.length} cameras reporting. ${people} ${people === 1 ? 'person' : 'people'} and ${vehicles} ${vehicles === 1 ? 'vehicle' : 'vehicles'} in view.`
 
   return <div className="canvas text-bone">
-    <GridTags streams={streams} />
+    {view === 'console' && <GridTags streams={streams} />}
     <Header status={status} fps={fps} latency={latency} serverTime={serverStatus?.server_time}
-      criticalCount={criticalCount} onOpenWatchlists={() => setWatchlistOpen(true)} />
+      criticalCount={criticalCount} onOpenWatchlists={() => setWatchlistOpen(true)} view={view} onNavigate={navigate} />
 
+    {view === 'about' ? <About onOpenConsole={() => navigate('console')} /> : <>
     <Landing cameraCount={streams.length} liveCount={liveCameras} />
 
     <main id="console" className="mx-auto max-w-[1440px] px-4 pb-16 sm:px-8">
@@ -121,6 +138,7 @@ export default function App() {
         <ErrorBoundary><AlertFeed alerts={alerts} cameraIds={streams.map(stream => stream.camera_id)} criticalFlash={criticalFlash} onClear={clearAlerts} /></ErrorBoundary>
       </div>
     </main>
+    </>}
 
     <WatchlistModal open={watchlistOpen} onClose={() => setWatchlistOpen(false)} />
     <FenceEditorModal open={fenceOpen} cameraId={fenceCamera} streams={streams} onClose={() => setFenceOpen(false)} />

@@ -9,6 +9,8 @@ interface Props {
   serverTime?: string
   criticalCount: number
   onOpenWatchlists: () => void
+  view: 'console' | 'about'
+  onNavigate: (view: 'console' | 'about') => void
 }
 
 const statusText: Record<ConnectionStatus, string> = {
@@ -18,7 +20,7 @@ const statusColor: Record<ConnectionStatus, string> = {
   CONNECTING: 'text-caution', CONNECTED: 'text-tide', DISCONNECTED: 'text-fog', RECONNECTING: 'text-caution', ERROR: 'text-breach',
 }
 
-export default function Header({ status, fps, latency, serverTime, criticalCount, onOpenWatchlists }: Props) {
+export default function Header({ status, fps, latency, serverTime, criticalCount, onOpenWatchlists, view, onNavigate }: Props) {
   const [clock, setClock] = useState(new Date())
   const [offset, setOffset] = useState(0)
   useEffect(() => { const t = window.setInterval(() => setClock(new Date()), 1000); return () => window.clearInterval(t) }, [])
@@ -41,8 +43,12 @@ export default function Header({ status, fps, latency, serverTime, criticalCount
     <div className="wordmark"><Shield size={18} strokeWidth={2.2} className="text-tide" />shield</div>
 
     <div className="flex items-center justify-end gap-2">
+      <nav className="seg" aria-label="Sections">
+        <button aria-current={view === 'console' ? 'page' : undefined} onClick={() => onNavigate('console')}>Console</button>
+        <button aria-current={view === 'about' ? 'page' : undefined} onClick={() => onNavigate('about')}>About</button>
+      </nav>
       {criticalCount > 0 && <span className="tag tag-critical hidden sm:inline-flex">{criticalCount} critical</span>}
-      <button onClick={onOpenWatchlists} className="pill pill-tide"><ScanFace size={14} />Watchlists</button>
+      {view === 'console' && <button onClick={onOpenWatchlists} className="pill pill-tide"><ScanFace size={14} /><span className="hidden sm:inline">Watchlists</span></button>}
     </div>
   </header>
 }
