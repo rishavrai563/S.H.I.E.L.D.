@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { Alert, CameraTelemetry, ConnectionStatus, RiskLevel, TelemetryFrame, Track } from '../types/telemetry'
+import type { Alert, CameraTelemetry, ConnectionStatus, RiskLevel, TelemetryFrame, Track, Vehicle } from '../types/telemetry'
 
 const MAX_ALERTS = 50
 
 function riskFrom(value: unknown): RiskLevel {
   const text = String(value ?? '').toUpperCase()
-  if (['CRITICAL', 'INTRUSION', 'BREACH_DETECTED', 'KNOWN_INTRUDER', 'UNAUTHORIZED_PERSONNEL'].includes(text)) return 'CRITICAL'
-  if (['WARNING', 'HIGH_ACTIVITY', 'ACTIVE', 'SUSPICIOUS_MOTION', 'INTERACTION', 'ISOLATED', 'HIGH_DENSITY'].includes(text)) return 'WARNING'
+  if (['CRITICAL', 'INTRUSION', 'BREACH_DETECTED', 'KNOWN_INTRUDER', 'UNAUTHORIZED_PERSONNEL', 'FACE_MATCH', 'FACE_MATCH_SUSPECT', 'ANPR_WATCHLIST_HIT'].includes(text)) return 'CRITICAL'
+  if (['WARNING', 'HIGH_ACTIVITY', 'ACTIVE', 'SUSPICIOUS_MOTION', 'LOITERING', 'NIGHT_MOVEMENT', 'FACE_MATCH_WATCHLIST', 'INTERACTION', 'ISOLATED', 'HIGH_DENSITY'].includes(text)) return 'WARNING'
   return 'NORMAL'
 }
 
@@ -20,7 +20,7 @@ function timestampFrom(value: unknown, fallback: string): string {
 
 function normalizeAlert(raw: any, index: number, fallbackTime: string, cameraId = 'system'): Alert {
   const rawType = String(raw?.alert_type ?? raw?.type ?? 'SECURITY_EVENT')
-  const impliedSeverity = rawType === 'FACE_MATCH' ? 'CRITICAL' : raw?.threat ?? rawType
+  const impliedSeverity = rawType.startsWith('FACE_MATCH') ? rawType : raw?.threat ?? rawType
   const severity = riskFrom(raw?.risk_level ?? impliedSeverity)
   const message = String(raw?.message ?? raw?.threat ?? raw?.plate ?? rawType.replace(/_/g, ' '))
   const alertTimestamp = timestampFrom(raw?.timestamp, fallbackTime)
@@ -50,6 +50,13 @@ function normalizeTrack(raw: any, index: number): Track | null {
   }
 }
 
+function normalizeVehicle(raw: any, index: number): Vehicle | null {
+  const bbox = raw?.bbox
+  if (!Array.isArray(bbox) || bbox.length !== 4) return null
+  return { id: Number(raw?.id ?? index), class_name: String(raw?.class_name ?? 'vehicle'), bbox: bbox.map(Number) as Vehicle['bbox'],
+    plate: String(raw?.plate ?? ''), watchlist_tag: String(raw?.watchlist_tag ?? '') }
+}
+
 export function normalizeTelemetry(raw: any): TelemetryFrame | null {
   if (!raw || typeof raw !== 'object') return null
   const timestamp = timestampFrom(raw.timestamp, new Date().toISOString())
@@ -70,6 +77,10 @@ export function normalizeTelemetry(raw: any): TelemetryFrame | null {
       frame_number: Number(camera.frame_number ?? raw.frame_id ?? raw.frame ?? 0),
       scene_status: sceneStatus,
       tracks,
+      vehicles: (Array.isArray(camera.vehicles) ? camera.vehicles : []).map(normalizeVehicle).filter(Boolean) as Vehicle[],
+      night_mode: Boolean(camera.night_mode),
+      analysis_fps: camera.analysis_fps == null ? undefined : Number(camera.analysis_fps),
+      latency_ms: camera.latency_ms == null ? undefined : Number(camera.latency_ms),
       alerts: cameraAlerts,
     }
   }
@@ -78,7 +89,9 @@ export function normalizeTelemetry(raw: any): TelemetryFrame | null {
     : Object.values(cameras).some(c => c.scene_status === 'WARNING') || globalAlerts.some(a => a.risk_level === 'WARNING')
       ? 'WARNING'
       : 'NORMAL'
-  return { timestamp, frame_id: Number(raw.frame_id ?? raw.frame ?? 0), overall_risk: riskFrom(raw.overall_risk ?? maxSeverity), cameras, global_alerts: globalAlerts }
+  return { timestamp, frame_id: Number(raw.frame_id ?? raw.frame ?? 0), overall_risk: riskFrom(raw.overall_risk ?? maxSeverity), cameras, global_alerts: globalAlerts,
+    processing_fps: raw.processing_fps == null ? undefined : Number(raw.processing_fps),
+    latency_ms: raw.latency_ms == null ? undefined : Number(raw.latency_ms) }
 }
 
 export function useTelemetry() {
