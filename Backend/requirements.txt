@@ -1,6 +1,9 @@
 # SHIELD - Python Dependencies
 
 # Core ML / Deep Learning
+# GPU: install the CUDA build of torch FIRST (plain `pip install torch` gives CPU-only on Windows):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# then verify with:  python scripts/check_gpu.py
 torch>=2.0.0
 torchvision>=0.15.0
 ultralytics>=8.1.0           # YOLOv11m object detection
@@ -32,3 +35,8 @@ httpx>=0.24.0                # Required by FastAPI TestClient
 
 # Optional: WhatsApp Alerting
 # pywhatkit>=5.4
+
+# Facial recognition uses OpenCV's built-in YuNet + SFace (no extra package).
+# Download the two ONNX models once:  cd Backend && python scripts/download_models.py
+# Optional 512-d FaceNet backend (face_recognition.backend: facenet):
+# facenet-pytorch>=2.5
